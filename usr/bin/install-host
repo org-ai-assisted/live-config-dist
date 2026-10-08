@@ -17,6 +17,7 @@ set -o pipefail
 set -o errtrace
 shopt -s inherit_errexit
 shopt -s shift_verbose
+export LC_ALL=C
 
 kernel_cmdline=''
 if [ -f /proc/cmdline ]; then
@@ -39,6 +40,19 @@ You are currently booted into 'LIVE Mode | USER Session', which does not provide
       exit 0
    fi
 fi
+
+## In unrestricted-admin mode the unlock -- check-unrestricted-admin.service purging
+## user-sysmaint-split so permission-hardener restores sudo/pkexec to 4755 root:root -- runs
+## a slow apt operation that does NOT hard-gate the desktop, so the installer can be launched
+## (by the autologin session or the user) BEFORE it finishes. During that window sudo/pkexec
+## are still 4750 root:sysmaint and not executable by 'user'. Wait for the unlock to finish
+## rather than racing it; only error if it genuinely never completes.
+elevate_deadline=$(( SECONDS + 180 ))
+while { ! [ -x '/usr/bin/pkexec' ] || ! [ -x '/usr/bin/sudo' ]; } \
+   && [ "${SECONDS}" -lt "${elevate_deadline}" ]; do
+   printf '%s\n' "$0: waiting for the unrestricted-admin unlock to finish (sudo/pkexec not yet executable)..."
+   sleep 2
+done
 
 if ! [ -x '/usr/bin/pkexec' ] || ! [ -x '/usr/bin/sudo' ]; then
    printf '%s\n' "$0: ERROR: **Unable To Elevate To Root**
