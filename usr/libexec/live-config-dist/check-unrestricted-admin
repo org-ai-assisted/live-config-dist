@@ -7,6 +7,9 @@ set -o errexit
 set -o nounset
 set -o errtrace
 set -o pipefail
+shopt -s inherit_errexit
+shopt -s shift_verbose
+export LC_ALL=C
 
 kernel_cmdline=''
 if [ -f /proc/cmdline ]; then
@@ -15,11 +18,24 @@ elif [ -f /proc/1/cmdline ]; then
   kernel_cmdline="$(cat -- /proc/1/cmdline)"
 fi
 
-if [[ "${kernel_cmdline}" =~ 'boot-role=unrestricted-admin' ]]; then
-   if ! [[ "${kernel_cmdline}" =~ 'rd.live.image' ]]; then
-      echo 'ERROR: Cannot boot in unrestricted admin mode unless on a live ISO!'
+if [[ "${kernel_cmdline}" =~ boot-role=unrestricted-admin ]]; then
+   if ! [[ "${kernel_cmdline}" =~ rd\.live\.image ]]; then
+      printf '%s\n' 'ERROR: Cannot boot in unrestricted admin mode unless on a live ISO!'
       exit 1
    fi
 
    dummy-dependency --purge --yes user-sysmaint-split
+
+   ## Belt-and-braces: purging user-sysmaint-split re-triggers security-misc
+   ## permission-hardener, which is SUPPOSED to restore sudo/pkexec to 4755 root:root from
+   ## its state DB. When that restore is incomplete (corrupt/missing state, trigger
+   ## ordering) the 'user' account cannot exec them and install-host aborts "Unable To
+   ## Elevate To Root", so the installer never launches. Force the perms this mode intends,
+   ## directly. Gated to the live ISO + unrestricted-admin (this whole branch), where
+   ## unprivileged root access IS the point, so no installed system is affected.
+   for admin_bin in /usr/bin/sudo /usr/bin/pkexec; do
+      if [ -e "${admin_bin}" ]; then
+         chmod 4755 -- "${admin_bin}"
+      fi
+   done
 fi
