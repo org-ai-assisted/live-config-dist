@@ -21,7 +21,20 @@ elif [ "$(dpkg --print-architecture)" = 'amd64' ]; then
     ## is the LUKS mapper device, which grub-install cannot embed into, while
     ## /boot resolves to the physical disk either way. /boot/grub does not
     ## exist yet. grub-probe comes from grub-common, already in the target.
+    ## Runs late enough: Calamares (calamares-settings-debian settings.conf) runs every
+    ## 'show' page, incl. 'partition', before any 'exec' job; in 'exec', bootloader-config
+    ## comes after 'partition' (applies the layout), 'mount' (mounts the target, incl. a
+    ## separate /boot) and 'unpackfs'. Observed in a BIOS install log: this helper ran as
+    ## job 17/30, and the following 'bootloader' job ran grub-install on /dev/sda.
+    if ! chroot "${CHROOT}" test -d /boot; then
+        printf '%s\n' "ERROR: ${CHROOT}/boot missing; cannot determine the grub-pc install device." >&2
+        exit 1
+    fi
     grub_pc_install_devices="$(chroot "${CHROOT}" grub-probe --target=disk /boot)"
+    if [ -z "${grub_pc_install_devices}" ]; then
+        printf '%s\n' "ERROR: grub-probe found no disk for ${CHROOT}/boot; refusing to seed an empty grub-pc/install_devices." >&2
+        exit 1
+    fi
     ## grub-probe can output multiple disks.
     grub_pc_install_devices="${grub_pc_install_devices//$'\n'/, }"
     printf '%s\n' "grub-pc grub-pc/install_devices multiselect ${grub_pc_install_devices}" | chroot "${CHROOT}" debconf-set-selections
