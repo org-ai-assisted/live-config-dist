@@ -16,7 +16,8 @@ set -x
 
 live_sources_param_list=( -o Dir::Etc::sourceparts='/usr/share/live-config-dist/sources.list.d' )
 
-CHROOT="$(mount | grep proc | grep calamares | awk '{print $3}' | sed -e "s#/proc##g")"
+## '|| true': no match must reach the explicit error below, not a silent errexit.
+CHROOT="$(mount | grep proc | grep calamares | awk '{print $3}' | sed -e "s#/proc##g")" || true
 if [ -z "${CHROOT}" ]; then
     printf '%s\n' "ERROR: could not determine the Calamares target root (no calamares proc mount)." >&2
     exit 1
@@ -78,7 +79,10 @@ elif [ "$(dpkg --print-architecture)" = 'amd64' ]; then
         printf '%s\n' "ERROR: ${CHROOT}/boot missing; cannot determine the grub-pc install device." >&2
         exit 1
     fi
-    grub_pc_install_devices="$(chroot "${CHROOT}" grub-probe --target=disk /boot)"
+    if ! grub_pc_install_devices="$(chroot "${CHROOT}" grub-probe --target=disk /boot)"; then
+        printf '%s\n' "ERROR: grub-probe --target=disk ${CHROOT}/boot failed; cannot determine the grub-pc install device." >&2
+        exit 1
+    fi
     if [ -z "${grub_pc_install_devices}" ]; then
         printf '%s\n' "ERROR: grub-probe found no disk for ${CHROOT}/boot; refusing to seed an empty grub-pc/install_devices." >&2
         exit 1
