@@ -15,6 +15,16 @@ if [ -d /sys/firmware/efi/efivars ]; then
 elif [ "$(dpkg --print-architecture)" = 'amd64' ]; then
     echo " * install grub... (bios)"
     chroot $CHROOT apt-get-noninteractive "${live_sources_param_list[@]}" update
+    ## Seed grub-pc/install_devices BEFORE installing grub-pc. Unseeded, its
+    ## postinst leaves it not fully configured and finish-grub-setup's
+    ## dpkg-reconfigure aborts. Probe /boot, not /: on an encrypted install /
+    ## is the LUKS mapper device, which grub-install cannot embed into, while
+    ## /boot resolves to the physical disk either way. /boot/grub does not
+    ## exist yet. grub-probe comes from grub-common, already in the target.
+    grub_pc_install_devices="$(chroot "${CHROOT}" grub-probe --target=disk /boot)"
+    ## grub-probe can output multiple disks.
+    grub_pc_install_devices="${grub_pc_install_devices//$'\n'/, }"
+    printf '%s\n' "grub-pc grub-pc/install_devices multiselect ${grub_pc_install_devices}" | chroot "${CHROOT}" debconf-set-selections
     chroot $CHROOT apt-get-noninteractive "${live_sources_param_list[@]}" -y install grub-pc
 fi
 
