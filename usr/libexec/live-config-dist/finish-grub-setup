@@ -43,15 +43,10 @@ if pkg_installed "grub-efi-${system_arch}"; then
    printf '%s\n' "$0: DEBUG: branch taken: grub-efi-${system_arch}"
    printf '%s\n' "grub-efi-${system_arch} grub2/force_efi_extra_removable boolean true" | debconf-set-selections
    dpkg-reconfigure-noninteractive "grub-efi-${system_arch}"
-elif pkg_installed grub-pc; then
-   printf '%s\n' "$0: DEBUG: branch taken: grub-pc"
-   ## Calamares doesn't configure debconf to know where GRUB is installed, so
-   ## we do that here.
-   grub_pc_disks="$(grub-probe --target=disk /boot/grub)"
-   ## grub-probe can output multiple disks.
-   install_devices="${grub_pc_disks//$'\n'/, }"
-   printf '%s\n' "grub-pc grub-pc/install_devices multiselect ${install_devices}" | debconf-set-selections
-   dpkg-reconfigure-noninteractive grub-pc
 else
-   printf '%s\n' "$0: DEBUG: branch taken: NONE (neither grub-efi-${system_arch} nor grub-pc fully installed)"
+   ## No grub-pc branch: calamares-bootloader-config.dist seeds grub-pc/install_devices
+   ## before installing grub-pc, whose postinst then installs GRUB to that disk, and it
+   ## aborts the install if it cannot. Re-seeding + dpkg-reconfigure here would only
+   ## repeat the same grub-install.
+   printf '%s\n' "$0: DEBUG: branch taken: NONE (grub-efi-${system_arch} not fully installed)"
 fi
