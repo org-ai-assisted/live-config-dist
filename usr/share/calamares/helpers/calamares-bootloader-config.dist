@@ -22,6 +22,38 @@ if [ -z "${CHROOT}" ]; then
     exit 1
 fi
 
+## DEBUG (temporary, BIOS grub-pc investigation): Calamares does not surface this job's
+## output, so mirror everything (incl. the set -x trace) into the TARGET, where it
+## survives on the installed disk.
+debug_log_dir="${CHROOT}/var/log/live-config-dist"
+mkdir --parents -- "${debug_log_dir}"
+exec > >(tee --append -- "${debug_log_dir}/bootloader-config.log") 2>&1
+debug_err_trap() {
+    local rc=$?
+    printf '%s\n' "DEBUG: FAILED rc=${rc} at line ${BASH_LINENO[0]} (command: see the set -x trace above)"
+}
+trap debug_err_trap ERR
+debug_grub_state() {
+    ## '${Status}' is a dpkg-query format, not a shell expansion.
+    # shellcheck disable=SC2016
+    printf '%s\n' "DEBUG($1): grub-pc Status: '$(chroot "${CHROOT}" dpkg-query --show --showformat='${Status}' grub-pc 2>&1 || true)'"
+    printf '%s\n' "DEBUG($1): grub-pc debconf:"
+    chroot "${CHROOT}" debconf-show grub-pc 2>&1 || true
+}
+printf '%s\n' "DEBUG: id: '$(id)'"
+printf '%s\n' "DEBUG: TMPDIR='${TMPDIR:-<unset>}' TMP='${TMP:-<unset>}' TEMP='${TEMP:-<unset>}'"
+if [ -n "${TMPDIR:-}" ]; then
+    printf '%s\n' "DEBUG: TMPDIR exists in target: $(chroot "${CHROOT}" test -d "${TMPDIR}" && printf yes || printf NO)"
+fi
+printf '%s\n' "DEBUG: DEBIAN_FRONTEND='${DEBIAN_FRONTEND:-<unset>}' PATH='${PATH}'"
+printf '%s\n' "DEBUG: LANG='${LANG:-<unset>}' LC_ALL='${LC_ALL:-<unset>}'"
+printf '%s\n' "DEBUG: CHROOT='${CHROOT}'"
+printf '%s\n' "DEBUG: lsblk:"
+lsblk --output NAME,TYPE,FSTYPE,MOUNTPOINTS 2>&1 || true
+printf '%s\n' "DEBUG: grub-probe --target=disk /: '$(chroot "${CHROOT}" grub-probe --target=disk / 2>&1 || true)'"
+printf '%s\n' "DEBUG: grub-probe --target=disk /boot: '$(chroot "${CHROOT}" grub-probe --target=disk /boot 2>&1 || true)'"
+debug_grub_state before-install
+
 printf '%s\n' "Running bootloader-config..."
 
 if [ -d /sys/firmware/efi/efivars ]; then
@@ -54,7 +86,9 @@ elif [ "$(dpkg --print-architecture)" = 'amd64' ]; then
     ## grub-probe can output multiple disks.
     grub_pc_install_devices="${grub_pc_install_devices//$'\n'/, }"
     printf '%s\n' "grub-pc grub-pc/install_devices multiselect ${grub_pc_install_devices}" | chroot "${CHROOT}" debconf-set-selections
+    debug_grub_state after-seed
     chroot "${CHROOT}" apt-get-noninteractive "${live_sources_param_list[@]}" -y install grub-pc
+    debug_grub_state after-grub-pc-install
 fi
 
 ## Re-enable os-prober:

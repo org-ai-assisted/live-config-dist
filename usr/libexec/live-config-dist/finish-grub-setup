@@ -14,6 +14,22 @@ export LC_ALL=C
 # shellcheck source=../../../../helper-scripts/usr/libexec/helper-scripts/package_installed_check.sh
 source /usr/libexec/helper-scripts/package_installed_check.sh
 
+## DEBUG (temporary, BIOS grub-pc investigation): mirror output into a log that
+## survives on the installed disk (Calamares does not surface it).
+mkdir --parents -- /var/log/live-config-dist
+exec > >(tee --append -- /var/log/live-config-dist/finish-grub-setup.log) 2>&1
+debug_err_trap() {
+   local rc=$?
+   printf '%s\n' "$0: DEBUG: FAILED rc=${rc} at line ${BASH_LINENO[0]}"
+}
+trap debug_err_trap ERR
+printf '%s\n' "$0: DEBUG: id: '$(id)' TMPDIR='${TMPDIR:-<unset>}'"
+if [ -n "${TMPDIR:-}" ]; then
+   printf '%s\n' "$0: DEBUG: TMPDIR exists: $(test -d "${TMPDIR}" && printf yes || printf NO)"
+fi
+printf '%s\n' "$0: DEBUG: grub-pc debconf:"
+debconf-show grub-pc 2>&1 || true
+
 system_arch="$(dpkg --print-architecture)"
 
 grub_pc_dpkg_query_output="$(dpkg-query --show --showformat='${Status}' "grub-pc" 2>&1)" || true
@@ -24,9 +40,11 @@ printf '%s\n' "$0: DEBUG: grub-pc grub_pc_dpkg_query_output: '${grub_pc_dpkg_que
 printf '%s\n' "$0: DEBUG: grub-efi-${system_arch} grub_efi_dpkg_query_output: '${grub_efi_dpkg_query_output}'"
 
 if pkg_installed "grub-efi-${system_arch}"; then
+   printf '%s\n' "$0: DEBUG: branch taken: grub-efi-${system_arch}"
    printf '%s\n' "grub-efi-${system_arch} grub2/force_efi_extra_removable boolean true" | debconf-set-selections
    dpkg-reconfigure-noninteractive "grub-efi-${system_arch}"
 elif pkg_installed grub-pc; then
+   printf '%s\n' "$0: DEBUG: branch taken: grub-pc"
    ## Calamares doesn't configure debconf to know where GRUB is installed, so
    ## we do that here.
    grub_pc_disks="$(grub-probe --target=disk /boot/grub)"
@@ -34,4 +52,6 @@ elif pkg_installed grub-pc; then
    install_devices="${grub_pc_disks//$'\n'/, }"
    printf '%s\n' "grub-pc grub-pc/install_devices multiselect ${install_devices}" | debconf-set-selections
    dpkg-reconfigure-noninteractive grub-pc
+else
+   printf '%s\n' "$0: DEBUG: branch taken: NONE (neither grub-efi-${system_arch} nor grub-pc fully installed)"
 fi
