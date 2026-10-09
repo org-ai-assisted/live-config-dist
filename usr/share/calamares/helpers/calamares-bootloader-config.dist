@@ -60,25 +60,29 @@ printf '%s\n' "Running bootloader-config..."
 if [ -d /sys/firmware/efi/efivars ]; then
     printf '%s\n' " * Installing grub-efi (uefi)..."
     chroot "${CHROOT}" apt-get-noninteractive "${live_sources_param_list[@]}" update
+    ## Seed BEFORE installing so grub-efi's postinst (and every later grub-efi upgrade)
+    ## also maintains the removable-media path EFI/BOOT/BOOTX64.EFI, which firmware
+    ## without a usable NVRAM boot entry falls back to.
+    target_arch="$(chroot "${CHROOT}" dpkg --print-architecture)"
+    printf '%s\n' "grub-efi-${target_arch} grub2/force_efi_extra_removable boolean true" | chroot "${CHROOT}" debconf-set-selections
     chroot "${CHROOT}" apt-get-noninteractive "${live_sources_param_list[@]}" -y install grub-efi
 elif [ "$(dpkg --print-architecture)" = 'amd64' ]; then
     printf '%s\n' " * install grub... (bios)"
     chroot "${CHROOT}" apt-get-noninteractive "${live_sources_param_list[@]}" update
     ## Seed grub-pc/install_devices BEFORE installing grub-pc, so its postinst installs
     ## GRUB to the real boot disk (observed: "grub-install success for /dev/sda", grub-pc
-    ## 'install ok installed'). Unseeded BIOS installs failed in Calamares (later
-    ## dpkg-reconfigure: "grub-pc is broken or not fully installed"); a plain-chroot
-    ## repro does NOT reproduce that, so the unseeded mechanism is unverified
-    ## (org-ai-assisted/grub-pc-seed-repro).
+    ## 'install ok installed'). Unseeded BIOS installs failed in Calamares ("grub-pc is
+    ## broken or not fully installed"); a plain-chroot repro does NOT reproduce that, so
+    ## the unseeded mechanism is unverified (org-ai-assisted/grub-pc-seed-repro).
     ## Probe /boot, not /: on an encrypted install / is the LUKS mapper device, which
     ## grub-install cannot embed into (observed: "embedding is not possible" for
     ## /dev/dm-0), while /boot resolves to the base disk. /boot/grub does not exist
     ## yet; grub-probe comes from grub-common, already in the target.
-    ## Runs late enough: Calamares (calamares-settings-debian settings.conf) runs every
-    ## 'show' page, incl. 'partition', before any 'exec' job; in 'exec', bootloader-config
-    ## comes after 'partition' (applies the layout), 'mount' (mounts the target, incl. a
-    ## separate /boot) and 'unpackfs'. Observed in a BIOS install log: this helper ran as
-    ## job 17/30, and the following 'bootloader' job ran grub-install on /dev/sda.
+    ## Runs late enough: Calamares (live-config-dist settings.conf) runs every 'show'
+    ## page, incl. 'partition', before any 'exec' job; in 'exec', bootloader-config comes
+    ## after 'partition' (applies the layout), 'mount' (mounts the target, incl. a
+    ## separate /boot), 'unpackfs' and 'grubcfg'; the 'bootloader' job (grub-install on
+    ## the same disk) follows it.
     if ! chroot "${CHROOT}" test -d /boot; then
         printf '%s\n' "ERROR: ${CHROOT}/boot missing; cannot determine the grub-pc install device." >&2
         exit 1
