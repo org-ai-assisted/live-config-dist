@@ -1,26 +1,42 @@
 #!/bin/bash
 
+## Full strict mode: without errexit a failing step (e.g. 'apt-get install grub-pc')
+## was silently ignored and the install carried on with grub-pc half-configured,
+## which only surfaced later (Calamares 'packages' step: "Package Manager error").
+## Anything half-configured must abort the install here instead.
+set -o errexit
+set -o nounset
+set -o pipefail
+set -o errtrace
+shopt -s inherit_errexit
+shopt -s shift_verbose
+export LC_ALL=C
+
 set -x
 
 live_sources_param_list=( -o Dir::Etc::sourceparts='/usr/share/live-config-dist/sources.list.d' )
 
-CHROOT=$(mount | grep proc | grep calamares | awk '{print $3}' | sed -e "s#/proc##g")
+CHROOT="$(mount | grep proc | grep calamares | awk '{print $3}' | sed -e "s#/proc##g")"
+if [ -z "${CHROOT}" ]; then
+    printf '%s\n' "ERROR: could not determine the Calamares target root (no calamares proc mount)." >&2
+    exit 1
+fi
 
-echo "Running bootloader-config..."
+printf '%s\n' "Running bootloader-config..."
 
 if [ -d /sys/firmware/efi/efivars ]; then
-    echo " * Installing grub-efi (uefi)..."
-    chroot $CHROOT apt-get-noninteractive "${live_sources_param_list[@]}" update
-    chroot $CHROOT apt-get-noninteractive "${live_sources_param_list[@]}" -y install grub-efi
+    printf '%s\n' " * Installing grub-efi (uefi)..."
+    chroot "${CHROOT}" apt-get-noninteractive "${live_sources_param_list[@]}" update
+    chroot "${CHROOT}" apt-get-noninteractive "${live_sources_param_list[@]}" -y install grub-efi
 elif [ "$(dpkg --print-architecture)" = 'amd64' ]; then
-    echo " * install grub... (bios)"
-    chroot $CHROOT apt-get-noninteractive "${live_sources_param_list[@]}" update
-    ## Seed grub-pc/install_devices BEFORE installing grub-pc. Unseeded, its
-    ## postinst leaves it not fully configured and finish-grub-setup's
-    ## dpkg-reconfigure aborts. Probe /boot, not /: on an encrypted install /
-    ## is the LUKS mapper device, which grub-install cannot embed into, while
-    ## /boot resolves to the physical disk either way. /boot/grub does not
-    ## exist yet. grub-probe comes from grub-common, already in the target.
+    printf '%s\n' " * install grub... (bios)"
+    chroot "${CHROOT}" apt-get-noninteractive "${live_sources_param_list[@]}" update
+    ## Seed grub-pc/install_devices BEFORE installing grub-pc, so its postinst can
+    ## install GRUB and configure fully instead of leaving it half-configured.
+    ## Probe /boot, not /: on an encrypted install / is the LUKS mapper device, which
+    ## grub-install cannot embed into (observed: "embedding is not possible" for
+    ## /dev/dm-0), while /boot resolves to the base disk. /boot/grub does not exist
+    ## yet; grub-probe comes from grub-common, already in the target.
     ## Runs late enough: Calamares (calamares-settings-debian settings.conf) runs every
     ## 'show' page, incl. 'partition', before any 'exec' job; in 'exec', bootloader-config
     ## comes after 'partition' (applies the layout), 'mount' (mounts the target, incl. a
@@ -38,9 +54,9 @@ elif [ "$(dpkg --print-architecture)" = 'amd64' ]; then
     ## grub-probe can output multiple disks.
     grub_pc_install_devices="${grub_pc_install_devices//$'\n'/, }"
     printf '%s\n' "grub-pc grub-pc/install_devices multiselect ${grub_pc_install_devices}" | chroot "${CHROOT}" debconf-set-selections
-    chroot $CHROOT apt-get-noninteractive "${live_sources_param_list[@]}" -y install grub-pc
+    chroot "${CHROOT}" apt-get-noninteractive "${live_sources_param_list[@]}" -y install grub-pc
 fi
 
-# Re-enable os-prober:
-sed -i "s/#GRUB_DISABLE_OS_PROBER=false/# OS_PROBER re-enabled by Debian Calamares installation:\nGRUB_DISABLE_OS_PROBER=false/g" $CHROOT/etc/default/grub
-chroot $CHROOT /usr/sbin/update-grub
+## Re-enable os-prober:
+sed -i "s/#GRUB_DISABLE_OS_PROBER=false/# OS_PROBER re-enabled by Debian Calamares installation:\nGRUB_DISABLE_OS_PROBER=false/g" "${CHROOT}/etc/default/grub"
+chroot "${CHROOT}" /usr/sbin/update-grub
