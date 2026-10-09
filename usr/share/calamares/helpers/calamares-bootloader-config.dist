@@ -44,7 +44,7 @@ debug_grub_state() {
 printf '%s\n' "DEBUG: id: '$(id)'"
 printf '%s\n' "DEBUG: TMPDIR='${TMPDIR:-<unset>}' TMP='${TMP:-<unset>}' TEMP='${TEMP:-<unset>}'"
 if [ -n "${TMPDIR:-}" ]; then
-    printf '%s\n' "DEBUG: TMPDIR exists in target: $(chroot "${CHROOT}" test -d "${TMPDIR}" && printf yes || printf NO)"
+    printf '%s\n' "DEBUG: TMPDIR exists in target: $(chroot "${CHROOT}" test -d "${TMPDIR}" && printf '%s' yes || printf '%s' NO)"
 fi
 printf '%s\n' "DEBUG: DEBIAN_FRONTEND='${DEBIAN_FRONTEND:-<unset>}' PATH='${PATH}'"
 printf '%s\n' "DEBUG: LANG='${LANG:-<unset>}' LC_ALL='${LC_ALL:-<unset>}'"
@@ -64,8 +64,12 @@ if [ -d /sys/firmware/efi/efivars ]; then
 elif [ "$(dpkg --print-architecture)" = 'amd64' ]; then
     printf '%s\n' " * install grub... (bios)"
     chroot "${CHROOT}" apt-get-noninteractive "${live_sources_param_list[@]}" update
-    ## Seed grub-pc/install_devices BEFORE installing grub-pc, so its postinst can
-    ## install GRUB and configure fully instead of leaving it half-configured.
+    ## Seed grub-pc/install_devices BEFORE installing grub-pc, so its postinst installs
+    ## GRUB to the real boot disk (observed: "grub-install success for /dev/sda", grub-pc
+    ## 'install ok installed'). Unseeded BIOS installs failed in Calamares (later
+    ## dpkg-reconfigure: "grub-pc is broken or not fully installed"); a plain-chroot
+    ## repro does NOT reproduce that, so the unseeded mechanism is unverified
+    ## (org-ai-assisted/grub-pc-seed-repro).
     ## Probe /boot, not /: on an encrypted install / is the LUKS mapper device, which
     ## grub-install cannot embed into (observed: "embedding is not possible" for
     ## /dev/dm-0), while /boot resolves to the base disk. /boot/grub does not exist

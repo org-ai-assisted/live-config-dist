@@ -25,7 +25,7 @@ debug_err_trap() {
 trap debug_err_trap ERR
 printf '%s\n' "$0: DEBUG: id: '$(id)' TMPDIR='${TMPDIR:-<unset>}'"
 if [ -n "${TMPDIR:-}" ]; then
-   printf '%s\n' "$0: DEBUG: TMPDIR exists: $(test -d "${TMPDIR}" && printf yes || printf NO)"
+   printf '%s\n' "$0: DEBUG: TMPDIR exists: $(test -d "${TMPDIR}" && printf '%s' yes || printf '%s' NO)"
 fi
 printf '%s\n' "$0: DEBUG: grub-pc debconf:"
 debconf-show grub-pc 2>&1 || true
