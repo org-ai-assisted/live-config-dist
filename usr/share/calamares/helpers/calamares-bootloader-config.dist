@@ -60,9 +60,10 @@ printf '%s\n' "Running bootloader-config..."
 if [ -d /sys/firmware/efi/efivars ]; then
     printf '%s\n' " * Installing grub-efi (uefi)..."
     chroot "${CHROOT}" apt-get-noninteractive "${live_sources_param_list[@]}" update
-    ## Seed BEFORE installing so grub-efi's postinst (and every later grub-efi upgrade)
-    ## also maintains the removable-media path EFI/BOOT/BOOTX64.EFI, which firmware
-    ## without a usable NVRAM boot entry falls back to.
+    ## Seed so every later grub-efi upgrade keeps the shim at the removable-media path
+    ## EFI/BOOT/BOOTX64.EFI, which firmware without a usable NVRAM boot entry falls
+    ## back to. The fresh install itself gets it from finish-grub-setup (grub-efi's
+    ## postinst skips grub-install here because no core.efi exists yet).
     target_arch="$(chroot "${CHROOT}" dpkg --print-architecture)"
     printf '%s\n' "grub-efi-${target_arch} grub2/force_efi_extra_removable boolean true" | chroot "${CHROOT}" debconf-set-selections
     chroot "${CHROOT}" apt-get-noninteractive "${live_sources_param_list[@]}" -y install grub-efi
