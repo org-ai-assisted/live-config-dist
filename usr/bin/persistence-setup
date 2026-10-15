@@ -276,34 +276,47 @@ delete_overlay_partitions() {
 
 ## Create the GPT partitions imperatively: boot (unencrypted, when encrypting)
 ## then the persistence overlay filling the remaining free space.
-create_partitions() {
-   local pttype
-
-   if [ "${target}" = 'disk' ]; then
-      ## A blank or non-GPT disk needs a fresh GPT (never on usb-freespace -- it
-      ## already carries the isohybrid GPT we must preserve).
-      pttype="$(blkid -o value -s PTTYPE -- "${device}" 2>/dev/null || true)"
-      if [ "${pttype}" != 'gpt' ]; then
-         log_run notice sgdisk -o "${device}"
-      fi
-   fi
-
-   if [ "${encrypt}" = 'true' ]; then
-      log_run notice sgdisk -n "0:0:+${boot_size}" -t "0:${boot_type_guid}" \
-         -c "0:${boot_label}" "${device}"
-   fi
-   log_run notice sgdisk -n '0:0:0' -t "0:${persist_type_guid}" \
-      -c "0:${persistence_label}" "${device}"
-   partprobe "${device}" 2>/dev/null || true
-   udevadm settle || true
-}
-
-## Echo the partition device carrying the given GPT partition label.
-partition_by_label() {
+## Sorted list of the device's partition node paths (one per line).
+list_partitions() {
    ## --raw: plain names; the default tree output prefixes child NAMEs with
    ## tree-drawing characters (|- / `-) that corrupt the device path.
-   lsblk --noheadings --raw --paths --output NAME,PARTLABEL "${device}" \
-      | awk -v l="${1}" '$2 == l { print $1; exit }'
+   lsblk --noheadings --raw --paths --output NAME,TYPE "${device}" \
+      | awk '$2 == "part" { print $1 }' | sort
+}
+
+## Create one GPT partition and set `new_partition` to the node that APPEARED
+## (diff before/after), so a pre-existing same-labelled partition can never be
+## taken for the new one. Sets a global (not echo) so log output on stdout
+## cannot pollute the captured value.
+create_one_partition() {
+   local before after
+   new_partition=''
+   before="$(list_partitions)"
+   log_run notice sgdisk "$@" "${device}"
+   partprobe "${device}" 2>/dev/null || true
+   udevadm settle || true
+   after="$(list_partitions)"
+   new_partition="$(comm -13 <(printf '%s\n' "${before}") <(printf '%s\n' "${after}") | head --lines 1)"
+}
+
+## Create the boot (when encrypting) + persistence partitions, capturing their
+## exact new device nodes into boot_partition / persistence_partition.
+create_partitions() {
+   boot_partition=''
+   persistence_partition=''
+
+   if [ "${encrypt}" = 'true' ]; then
+      create_one_partition -n "0:0:+${boot_size}" -t "0:${boot_type_guid}" -c "0:${boot_label}"
+      boot_partition="${new_partition}"
+      if [ -z "${boot_partition}" ]; then
+         die 1 "could not identify the new '${boot_label}' partition."
+      fi
+   fi
+   create_one_partition -n '0:0:0' -t "0:${persist_type_guid}" -c "0:${persistence_label}"
+   persistence_partition="${new_partition}"
+   if [ -z "${persistence_partition}" ]; then
+      die 1 "could not identify the new '${persistence_label}' partition."
+   fi
 }
 
 ## Seed the OverlayFS upper + work dirs on an already-formatted filesystem.
@@ -365,8 +378,9 @@ persistence_setup_cleanup() {
 }
 
 main() {
-   local device_opt existing_state node_fstype node_label candidate_disk \
-      cmdline_file device_type boot_partition persistence_partition
+   local device_opt existing_state candidate_disk cmdline_file \
+      device_type boot_partition persistence_partition keyfile_size \
+      col_fstype col_partlabel col_label
 
    ## Defaults + unset sentinels.
    target='usb-freespace'
@@ -464,8 +478,11 @@ main() {
          if [ ! -r "${keyfile}" ]; then
             die 1 "--keyfile '${keyfile}' is not readable."
          fi
-         if [ ! -s "${keyfile}" ]; then
-            die 1 "--keyfile '${keyfile}' is empty; an empty key would be trivially guessable."
+         ## Reject a trivially small key (a lone newline is 1 byte and cryptsetup
+         ## would accept it as the key). Not an entropy check -- just a floor.
+         keyfile_size="$(stat -c %s -- "${keyfile}")"
+         if [ "${keyfile_size}" -lt 16 ]; then
+            die 1 "--keyfile '${keyfile}' is too small (${keyfile_size} bytes); need at least 16 bytes of key material."
          fi
       fi
       if ! [[ "${luks_uuid}" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]]; then
@@ -488,7 +505,11 @@ main() {
 
    ## --- preflight dependencies --------------------------------------------
    die_if_not_has lsblk blkid sgdisk wipefs cryptsetup udevadm mount umount \
-      mktemp findmnt shred awk partprobe sort "mkfs.${filesystem}"
+      mktemp findmnt shred awk partprobe sort comm stat "mkfs.${filesystem}"
+   if [ "${encrypt}" = 'true' ]; then
+      ## The unencrypted boot area is always ext4, regardless of --filesystem.
+      die_if_not_has mkfs.ext4
+   fi
    if [ "${enroll_tpm:-false}" = 'true' ]; then
       die_if_not_has systemd-cryptenroll
    fi
@@ -552,22 +573,40 @@ main() {
          ;;
    esac
    ## Never the boot disk under --target disk (that is what usb-freespace is for).
-   if [ "${target}" = 'disk' ] && [ -n "${boot_disk}" ] && [ "${device}" = "${boot_disk}" ]; then
+   ## Compare by kernel NAME: boot_disk is /dev/-prefixed (lsblk --paths) but
+   ## --device may be given bare ('sda'), so a raw string compare would miss it.
+   if [ "${target}" = 'disk' ] && [ -n "${boot_disk}" ] \
+      && [ "${device#/dev/}" = "${boot_disk#/dev/}" ]; then
       die 1 "'${device}' is the booted live disk; use --target usb-freespace for it."
    fi
 
-   ## --- refuse to clobber an existing overlay unless --force --------------
+   ## --- refuse to clobber existing content unless --force -----------------
+   ## Per-column lsblk (not multi-column: --raw collapses empty fields and
+   ## misparses under a single read).
    existing_state=''
-   while read -r node_fstype node_label; do
-      if [ "${node_fstype}" = 'crypto_LUKS' ]; then
+   if [ "${target}" = 'disk' ]; then
+      ## A whole second disk is ours; ANY pre-existing table or filesystem is
+      ## data we would destroy -- require --force over it.
+      if [ -n "$(blkid -o value -s PTTYPE -- "${device}" 2>/dev/null || true)" ]; then
+         existing_state='an existing partition table'
+      elif [ -n "$(blkid -o value -s TYPE -- "${device}" 2>/dev/null || true)" ]; then
+         existing_state='an existing filesystem'
+      fi
+   else
+      ## usb-freespace: only OUR overlay counts (the ISO partitions are
+      ## expected). Capture each column first (a here-string, not a pipe into
+      ## grep -q).
+      col_fstype="$(lsblk --noheadings --raw --output FSTYPE -- "${device}")"
+      col_partlabel="$(lsblk --noheadings --raw --output PARTLABEL -- "${device}")"
+      col_label="$(lsblk --noheadings --raw --output LABEL -- "${device}")"
+      if grep --fixed-strings --line-regexp --quiet -- 'crypto_LUKS' <<< "${col_fstype}"; then
          existing_state='a LUKS container'
-         break
+      elif grep --fixed-strings --line-regexp --quiet -e "${persistence_label}" -e "${boot_label}" <<< "${col_partlabel}"; then
+         existing_state='an existing overlay partition'
+      elif grep --fixed-strings --line-regexp --quiet -- "${persistence_label}" <<< "${col_label}"; then
+         existing_state="an existing '${persistence_label}' filesystem"
       fi
-      if [ "${node_label}" = "${persistence_label}" ]; then
-         existing_state="a '${persistence_label}' filesystem"
-         break
-      fi
-   done < <(lsblk --noheadings --raw --output FSTYPE,LABEL -- "${device}")
+   fi
    if [ "${force}" != 'true' ] && [ -n "${existing_state}" ]; then
       die 1 "'${device}' already holds ${existing_state}; re-run with --force to reformat."
    fi
@@ -592,28 +631,27 @@ main() {
    fi
 
    ## --- carve + format ----------------------------------------------------
-   ## Delete the old overlay partitions BEFORE sgdisk -e: -e triggers a kernel
-   ## partition re-read whose udev events have not landed immediately after, so
-   ## reading PARTLABELs right after -e races empty.
-   if [ "${force}" = 'true' ]; then
-      delete_overlay_partitions
-   fi
-   if [ "${target}" = 'usb-freespace' ]; then
-      ## Relocate the isohybrid backup-GPT header to the true device end so the
-      ## trailing free space becomes usable.
+   if [ "${target}" = 'disk' ]; then
+      ## A whole dedicated disk: start from a clean GPT. --zap-all clears any
+      ## GPT, MBR/DOS label and foreign LUKS (guarded by the content check +
+      ## --force above), so create always lands on empty, aligned free space --
+      ## and it works on a DOS-labelled disk, which `sgdisk -o` refuses.
+      log_run notice sgdisk --zap-all "${device}"
+   else
+      ## usb-freespace: preserve the ISO partitions. On --force drop only OUR
+      ## overlay partitions (BEFORE sgdisk -e, whose kernel re-read would race
+      ## the PARTLABEL read). Then relocate the isohybrid backup-GPT header to
+      ## the true device end so the trailing free space is usable.
+      if [ "${force}" = 'true' ]; then
+         delete_overlay_partitions
+      fi
       log_run notice sgdisk -e "${device}"
    fi
+
+   ## Captures the EXACT new nodes into persistence_partition / boot_partition.
    create_partitions
 
-   persistence_partition="$(partition_by_label "${persistence_label}")"
-   if [ -z "${persistence_partition}" ]; then
-      die 1 "could not locate the new '${persistence_label}' partition."
-   fi
    if [ "${encrypt}" = 'true' ]; then
-      boot_partition="$(partition_by_label "${boot_label}")"
-      if [ -z "${boot_partition}" ]; then
-         die 1 "could not locate the new '${boot_label}' partition."
-      fi
       log_run notice wipefs --all -- "${boot_partition}"
       mkfs.ext4 -L "${boot_label}" "${boot_partition}"
    fi
