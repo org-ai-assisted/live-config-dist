@@ -43,6 +43,8 @@ source "${HELPER_SCRIPTS_PATH:-}"/usr/libexec/helper-scripts/log_run_die.sh
 source "${HELPER_SCRIPTS_PATH:-}"/usr/libexec/helper-scripts/strings.bsh
 # shellcheck source=../../../helper-scripts/usr/libexec/helper-scripts/password_strength.sh
 source "${HELPER_SCRIPTS_PATH:-}"/usr/libexec/helper-scripts/password_strength.sh
+# shellcheck source=../../../helper-scripts/usr/libexec/helper-scripts/persistent-boot.sh
+source "${HELPER_SCRIPTS_PATH:-}"/usr/libexec/helper-scripts/persistent-boot.sh
 
 persistence_label='persistence'
 ## Unencrypted boot area for the (future) updatable-boot feature: the signed grub
@@ -320,6 +322,47 @@ seed_overlay_dirs() {
    rmdir -- "${mount_dir}"
 }
 
+## Seed the writable boot area so the updatable-kernel grub.cfg path works from
+## the FIRST persistent boot: copy the current (ISO) signed kernel+initrd into a
+## grub-readable boot partition and write its grub.cfg (the signed ISO grub
+## search --label + configfile hands off to it). The kernel postinst hook later
+## adds upgraded kernels. $1 = the boot partition node (persistbootx when
+## encrypted; the plaintext persistence partition otherwise -- both ext4, which
+## grub reads; LUKS it cannot). Kernel source is the live medium's /live dir;
+## PERSISTENCE_SETUP_LIVE_KERNEL_DIR overrides it (tests, and unusual media).
+seed_writable_boot() {
+   local boot_device kernel_src kver mount_dir boot_dir cmdline medium
+   boot_device="${1}"
+   kernel_src="${PERSISTENCE_SETUP_LIVE_KERNEL_DIR:-}"
+   if [ -z "${kernel_src}" ]; then
+      for medium in /run/initramfs/live /run/rootfsbase; do
+         if [ -e "${medium}/live/vmlinuz" ]; then
+            kernel_src="${medium}/live"
+            break
+         fi
+      done
+   fi
+   if [ -z "${kernel_src}" ] || [ ! -e "${kernel_src}/vmlinuz" ] \
+      || [ ! -e "${kernel_src}/initrd.img" ]; then
+      die 1 "could not locate the live kernel+initrd to seed the boot area (looked in '${kernel_src:-/run/initramfs/live/live}'); set PERSISTENCE_SETUP_LIVE_KERNEL_DIR."
+   fi
+   kver="$(uname -r)"
+   mount_dir="$(mktemp --directory)"
+   log_run notice mount -- "${boot_device}" "${mount_dir}"
+   boot_dir="${mount_dir}/boot"
+   log_run notice mkdir --parents -- "${boot_dir}"
+   log_run notice cp -- "${kernel_src}/vmlinuz" "${boot_dir}/vmlinuz-${kver}"
+   log_run notice cp -- "${kernel_src}/initrd.img" "${boot_dir}/initrd.img-${kver}"
+   if [ "${encrypt}" = 'true' ]; then
+      cmdline="$(persistent_boot_cmdline "${persistence_label}" "${luks_uuid}")"
+   else
+      cmdline="$(persistent_boot_cmdline "${persistence_label}")"
+   fi
+   persistent_boot_write_grub_cfg "${boot_dir}" "${cmdline}"
+   log_run notice umount -- "${mount_dir}"
+   rmdir -- "${mount_dir}"
+}
+
 ## Format + seed the persistence partition: LUKS2 (if encrypting) then the
 ## filesystem, or the plain filesystem.
 provision_persistence_fs() {
@@ -494,7 +537,8 @@ main() {
 
    ## --- preflight dependencies --------------------------------------------
    die_if_not_has lsblk blkid sgdisk wipefs cryptsetup udevadm mount umount \
-      mktemp findmnt shred awk partprobe sort comm stat "mkfs.${filesystem}"
+      mktemp findmnt shred awk partprobe sort comm stat cp uname head cat \
+      "mkfs.${filesystem}"
    if [ "${encrypt}" = 'true' ]; then
       ## The unencrypted boot area is always ext4, regardless of --filesystem.
       die_if_not_has mkfs.ext4
@@ -653,6 +697,14 @@ main() {
    fi
 
    provision_persistence_fs "${persistence_partition}"
+
+   ## Seed the writable boot area (persistbootx when encrypted, else the plaintext
+   ## persistence partition) so the updatable-kernel path is live from boot 1.
+   if [ "${encrypt}" = 'true' ]; then
+      seed_writable_boot "${boot_partition}"
+   else
+      seed_writable_boot "${persistence_partition}"
+   fi
 
    ## --- report ------------------------------------------------------------
    log notice "Done. '${device}' now carries a '${persistence_label}' overlay."
