@@ -133,19 +133,20 @@ resolve_boot_disk() {
 ## (dm/md/LUKS mapping) -- zapping a held disk would corrupt the active mapping.
 ## Validates an explicit --target disk device by PROPERTY, so a legitimately
 ## named disk (loop, mapper, vendor nvme quirk) is judged by what it IS, not by
-## a hard-coded name pattern.
+## a hard-coded name pattern. lsblk resolves the device (a by-id symlink, a
+## '//'/'..' path) to the REAL kernel names of the disk + its partitions, so a
+## holder on an aliased path is never missed and a sibling disk whose name
+## shares a prefix (sda vs sdaa, nvme0n1 vs nvme0n10) is never over-matched.
 disk_is_held() {
-   local disk_name sysfs_block_dir
-   disk_name="${1#/dev/}"
-   ## The glob covers the disk and its partitions (sda, sda1, ...; loop1, loop1p1).
-   for sysfs_block_dir in "/sys/class/block/${disk_name}"*; do
-      if ! [ -d "${sysfs_block_dir}" ]; then
+   local kname
+   while read -r kname; do
+      if [ -z "${kname}" ]; then
          continue
       fi
-      if [ -n "$(find "${sysfs_block_dir}/holders" -mindepth 1 -maxdepth 1 2>&1)" ]; then
+      if [ -n "$(find "/sys/class/block/${kname}/holders" -mindepth 1 -maxdepth 1 2>/dev/null)" ]; then
          return 0
       fi
-   done
+   done < <(lsblk --noheadings --output KNAME -- "${1}" 2>/dev/null)
    return 1
 }
 
