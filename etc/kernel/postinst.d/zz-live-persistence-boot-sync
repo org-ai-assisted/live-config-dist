@@ -44,10 +44,12 @@ boot_label='persistbootx'
 cmdline_file="${PERSISTENT_BOOT_CMDLINE_FILE:-/proc/cmdline}"
 
 ## Gate FIRST, before sourcing anything: only a persistent-overlay live boot has
-## a boot area to maintain. The trailing ':' anchors to the exact label token
-## (LABEL=<label>:<path>), so 'persistence' does not also match 'persistence-old'.
+## a boot area to maintain. Match the label as a whole token -- followed by ':'
+## (the optional dracut subpath), whitespace, or end -- so the pathless dracut
+## form 'rd.live.overlay=LABEL=persistence' is accepted while 'persistence-old'
+## is not.
 if [ ! -r "${cmdline_file}" ] \
-   || ! grep --quiet --fixed-strings -- "rd.live.overlay=LABEL=${persistence_label}:" "${cmdline_file}"; then
+   || ! grep --quiet --extended-regexp -- "rd[.]live[.]overlay=LABEL=${persistence_label}(:|[[:space:]]|\$)" "${cmdline_file}"; then
    exit 0
 fi
 
@@ -81,7 +83,7 @@ boot_sync_cleanup() {
 trap boot_sync_cleanup EXIT
 
 sync_boot_area() {
-   local boot_dev luks_uuid luks_rc cmdline boot_dir tmp_kernel tmp_initrd
+   local boot_dev luks_uuid luks_rc cmdline boot_dir tmp_kernel tmp_initrd copy_ok
 
    ## Resolve persistbootx on the BOOTED stick (never a second device, never the
    ## open LUKS mapper, which has no GPT PARTLABEL).
@@ -117,24 +119,39 @@ sync_boot_area() {
    ## would have freed room is never reached -- a permanent wedge).
    persistent_boot_prune "${boot_dir}" "${kernel_src_dir}"
 
-   ## Copy to a temp name then atomically rename, so an interrupted or ENOSPC copy
+   ## Stage to a temp name then atomically rename, so an interrupted/ENOSPC copy
    ## never leaves a truncated image under a live filename. --dereference: copy a
    ## source symlink's CONTENT (live media's vmlinuz is a symlink), not a dangling
-   ## link. --remove-destination: replace a planted destination symlink on this
-   ## unencrypted fs rather than writing THROUGH it (root arbitrary-overwrite).
+   ## link. --remove-destination + --no-target-directory: replace a planted
+   ## destination symlink (incl. one pointing at a directory) on this unencrypted
+   ## fs rather than writing THROUGH it (root arbitrary-overwrite). Best-effort:
+   ## a copy failure is recorded, not early-returned, so grub.cfg is still
+   ## regenerated below to match what is ACTUALLY present (never a stale pointer).
+   copy_ok='true'
    tmp_kernel="${boot_dir}/.vmlinuz-${kernel_version}.new"
    tmp_initrd="${boot_dir}/.initrd.img-${kernel_version}.new"
-   cp --dereference --remove-destination -- "${kernel_src_dir}/vmlinuz-${kernel_version}" "${tmp_kernel}" || return 1
-   cp --dereference --remove-destination -- "${kernel_src_dir}/initrd.img-${kernel_version}" "${tmp_initrd}" || return 1
-   mv --force -- "${tmp_kernel}" "${boot_dir}/vmlinuz-${kernel_version}" || return 1
-   mv --force -- "${tmp_initrd}" "${boot_dir}/initrd.img-${kernel_version}" || return 1
+   cp --dereference --remove-destination --no-target-directory -- "${kernel_src_dir}/vmlinuz-${kernel_version}" "${tmp_kernel}" || copy_ok='false'
+   cp --dereference --remove-destination --no-target-directory -- "${kernel_src_dir}/initrd.img-${kernel_version}" "${tmp_initrd}" || copy_ok='false'
+   if [ "${copy_ok}" = 'true' ]; then
+      mv --force --no-target-directory -- "${tmp_kernel}" "${boot_dir}/vmlinuz-${kernel_version}" || copy_ok='false'
+      mv --force --no-target-directory -- "${tmp_initrd}" "${boot_dir}/initrd.img-${kernel_version}" || copy_ok='false'
+   fi
+   safe-rm --force -- "${tmp_kernel}" "${tmp_initrd}" 2>/dev/null || true
 
-   cmdline="$(persistent_boot_cmdline "${persistence_label}" "${luks_uuid}")" || return 1
-   persistent_boot_write_grub_cfg "${boot_dir}" "${cmdline}" || return 1
+   ## Regenerate grub.cfg from ACTUAL contents regardless of the copy outcome, so
+   ## it never points at a kernel that was pruned but not replaced (clears the
+   ## cfg entirely if nothing remains -> ISO grub falls through to amnesic).
+   cmdline="$(persistent_boot_cmdline "${persistence_label}" "${luks_uuid}")" || cmdline=''
+   if [ -n "${cmdline}" ]; then
+      persistent_boot_write_grub_cfg "${boot_dir}" "${cmdline}" || true
+   fi
 
-   umount -- "${seed_mount_dir}" || return 1
+   umount -- "${seed_mount_dir}" || true
    rmdir -- "${seed_mount_dir}" 2>/dev/null || true
    seed_mount_dir=''
+   if [ "${copy_ok}" != 'true' ]; then
+      return 1
+   fi
    return 0
 }
 

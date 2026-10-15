@@ -360,8 +360,8 @@ seed_writable_boot() {
    ## --dereference: the live medium's vmlinuz/initrd.img may be symlinks; copy
    ## their CONTENT (not a dangling link). --remove-destination: replace a
    ## destination entry (incl. a symlink) rather than writing through it.
-   log_run notice cp --dereference --remove-destination -- "${kernel_src}/vmlinuz" "${boot_dir}/vmlinuz-${kver}"
-   log_run notice cp --dereference --remove-destination -- "${kernel_src}/initrd.img" "${boot_dir}/initrd.img-${kver}"
+   log_run notice cp --dereference --remove-destination --no-target-directory -- "${kernel_src}/vmlinuz" "${boot_dir}/vmlinuz-${kver}"
+   log_run notice cp --dereference --remove-destination --no-target-directory -- "${kernel_src}/initrd.img" "${boot_dir}/initrd.img-${kver}"
    if [ "${encrypt}" = 'true' ]; then
       cmdline="$(persistent_boot_cmdline "${persistence_label}" "${luks_uuid}")"
    else
