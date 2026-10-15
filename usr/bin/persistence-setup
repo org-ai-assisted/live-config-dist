@@ -8,12 +8,13 @@
 ## Provision a persistent overlay for a live ISO, in the booted USB's OWN
 ## trailing free space (default) or on a second disk. NON-INTERACTIVE: driven by
 ## mandatory flags, no prompts. The only interactive step is the passphrase
-## prompt systemd-cryptsetup shows at BOOT (for an encrypted overlay).
+## prompt systemd-cryptsetup shows at BOOT (for a password-encrypted overlay).
 ##
-## Engine: systemd-repart (GPT), which partitions + optionally LUKS2-encrypts +
-## formats + labels in one pass. For the booted stick, `sgdisk -e` first relocates
-## the isohybrid backup-GPT header to the true device end so repart sees the
-## trailing free space.
+## Engine: imperative sgdisk (GPT) + cryptsetup. sgdisk CREATES fresh partitions
+## (and, with --force, deletes the old overlay partitions first and recreates
+## them -- a true reformat); cryptsetup luksFormat encrypts with a deterministic
+## header UUID. For the booted stick, `sgdisk -e` first relocates the isohybrid
+## backup-GPT header to the true device end so the trailing free space is usable.
 
 # shellcheck source=../../../helper-scripts/usr/libexec/helper-scripts/check_runtime.bsh
 source "${HELPER_SCRIPTS_PATH:-}"/usr/libexec/helper-scripts/check_runtime.bsh || true
@@ -44,20 +45,29 @@ source "${HELPER_SCRIPTS_PATH:-}"/usr/libexec/helper-scripts/strings.bsh
 source "${HELPER_SCRIPTS_PATH:-}"/usr/libexec/helper-scripts/password_strength.sh
 
 persistence_label='persistence'
-## Unencrypted boot area for the (future) updatable-boot feature: the signed
-## grub can read ext4 but NOT LUKS, so an encrypted overlay keeps its updatable
-## kernel+initrd+grub.cfg here. Created only when encrypting; harmless if unused.
+## Unencrypted boot area for the (future) updatable-boot feature: the signed grub
+## can read ext4 but NOT LUKS, so an encrypted overlay keeps its updatable
+## kernel+initrd+grub.cfg here. Carved only when encrypting; empty until used.
 boot_label='persistbootx'
 boot_size='512M'
 overlay_dir='live/overlay'
 overlay_workdir='live/ovlwork'
 
-## HARDCODED, also in derivative-maker dm-raw-to-iso: the ISO's LUKS persistence
-## boot entry pins rd.luks.uuid to this, so dracut can find+unlock the overlay.
-## repart assigns a random LUKS header UUID, so it is reset to this afterwards.
+## GPT partition type GUIDs (Discoverable Partitions Spec / LUKS convention).
+persist_type_guid_plain='0FC63DAF-8483-4772-8E79-3D69D8477DE4'
+persist_type_guid_luks='CA7D7CCB-63ED-4C53-861C-1742536059CC'
+boot_type_guid='BC13C2FF-59E6-4262-A352-B275FD6F7172'
+
+## HARDCODED default, also in derivative-maker dm-raw-to-iso: the ISO's LUKS
+## persistence boot entry pins rd.luks.uuid to this so dracut finds+unlocks the
+## overlay. Override with --luks-uuid (then adjust the ISO / GRUB cmdline to match).
 ##
 ## TODO-HUMAN-DEVELOPER-ONLY: Regenerate this UUID securely.
 default_luks_uuid='40e273d7-4e63-4459-b16f-ba3df4374905'
+
+## Set by provision_persistence_fs while a LUKS mapping is open, so the EXIT trap
+## can close it on any failure.
+open_mapper=''
 
 usage() {
    printf '%s\n' "Usage: ${0##*/} --encrypt true|false [OPTIONS]
@@ -69,15 +79,20 @@ Required:
                              No default; must be given explicitly.
 
 When --encrypt true:
-      --key-type <list>      comma-separated unlock methods, one or more of:
-                             password, keyfile, tpm. e.g. --key-type password
-                             or --key-type password,tpm.
+      --key-type <list>      comma-separated unlock methods. A 'password' or
+                             'keyfile' PRIMARY is required; 'tpm' may be added
+                             (tpm alone is refused -- it binds the stick to one
+                             machine and leaves no portable unlock). e.g.
+                             --key-type password or --key-type password,tpm.
       --passphrase-file <f>  file with the passphrase (or '-' for stdin).
                              Required when --key-type includes 'password'.
                              NEVER pass a passphrase on argv.
-      --keyfile <f>          key file to enroll. Required when --key-type
-                             includes 'keyfile'.
+      --keyfile <f>          non-empty key file to enroll. Required when
+                             --key-type includes 'keyfile'.
       --allow-weak-passphrase  skip the passphrase-strength gate (pwscore).
+      --luks-uuid <uuid>     LUKS2 header UUID (default: a fixed value the ISO
+                             recognizes). Change only if you adjust the ISO to
+                             match.
 
 Target:
       --target usb-freespace|disk   where to create the overlay.
@@ -87,8 +102,8 @@ Target:
 
 Other:
   -f, --filesystem <fs>      overlay filesystem: ext4 or btrfs (default: ext4).
-      --force                proceed even if the target already holds a
-                             persistence or LUKS volume (reformats).
+      --force                reformat even if the target already holds a
+                             persistence or LUKS volume (deletes + recreates it).
   -h, --help                 show this help.
 "
    exit "${1}"
@@ -108,16 +123,14 @@ resolve_boot_disk() {
    if [ -z "${live_src}" ]; then
       return 0
    fi
-   parent="$(lsblk --noheadings --output PKNAME --nodeps 2>/dev/null --paths "${live_src}" | head --lines 1 || true)"
-   if [ -z "${parent}" ]; then
-      parent="$(lsblk --noheadings --output PKNAME --paths "${live_src}" 2>/dev/null | head --lines 1 || true)"
-   fi
+   parent="$(lsblk --noheadings --output PKNAME --paths "${live_src}" 2>/dev/null | head --lines 1 || true)"
    if [ -n "${parent}" ]; then
       boot_disk="${parent}"
    fi
 }
 
-## For --target disk: whole, unmounted, unheld disks only (never the boot disk).
+## For --target disk: whole, unmounted, unheld disks only; the boot disk is
+## excluded by the caller.
 build_candidate_disk_list() {
    local lsblk_line lsblk_disk_name lsblk_mounts_str sysfs_block_dir dev_is_held
 
@@ -185,12 +198,12 @@ parse_key_type() {
    done
 }
 
-## Map the parsed key-type set to the repart Encrypt= value, the primary
-## --key-file source, and whether a keyfile needs a second slot via cryptenroll.
+## Decide the PRIMARY unlock (the slot luksFormat creates) and which extra slots
+## to enroll. A password or keyfile primary is mandatory; tpm is additive only.
 plan_encryption() {
-   encrypt_value=''
    primary_key_kind='none'
    enroll_keyfile_extra='false'
+   enroll_tpm='false'
 
    if [ "${has_password}" = 'true' ]; then
       primary_key_kind='password'
@@ -199,18 +212,13 @@ plan_encryption() {
    fi
 
    if [ "${primary_key_kind}" = 'none' ]; then
-      ## tpm only.
-      encrypt_value='tpm2'
-   elif [ "${has_tpm}" = 'true' ]; then
-      encrypt_value='key-file+tpm2'
-   else
-      encrypt_value='key-file'
+      die 1 "--key-type tpm requires a 'password' or 'keyfile' primary too (a portable overlay cannot be TPM-only)."
    fi
-
-   ## password AND keyfile: password is the primary key-file slot, keyfile is an
-   ## additional slot enrolled after creation.
    if [ "${has_password}" = 'true' ] && [ "${has_keyfile}" = 'true' ]; then
       enroll_keyfile_extra='true'
+   fi
+   if [ "${has_tpm}" = 'true' ]; then
+      enroll_tpm='true'
    fi
 }
 
@@ -224,7 +232,8 @@ read_passphrase() {
    fi
 }
 
-## Write the primary key material to a tmpfs (RAM-only) file for --key-file.
+## The key material that luksFormat / luksAddKey / cryptenroll / luksOpen unlock
+## with: the passphrase (RAM-only tmpfs file) or the keyfile path.
 make_primary_key_file() {
    primary_key_file=''
    if [ "${primary_key_kind}" = 'password' ]; then
@@ -235,83 +244,129 @@ make_primary_key_file() {
    fi
 }
 
-## Assemble the systemd-repart definitions directory from the parsed options.
-assemble_repart_defs() {
-   defdir="$(mktemp --directory)"
+## --force: delete the existing overlay partitions so they are recreated fresh.
+delete_overlay_partitions() {
+   local -a nums
+   local pn plabel
 
-   if [ "${encrypt}" = 'true' ]; then
-      ## Small UNENCRYPTED boot area first (for the updatable-boot feature).
-      cat > "${defdir}/40-boot.conf" <<EOF
-[Partition]
-Type=xbootldr
-Label=${boot_label}
-Format=ext4
-SizeMinBytes=${boot_size}
-SizeMaxBytes=${boot_size}
-EOF
-      cat > "${defdir}/50-persist.conf" <<EOF
-[Partition]
-Type=root
-Label=${persistence_label}
-Format=${filesystem}
-Encrypt=${encrypt_value}
-EOF
-   else
-      cat > "${defdir}/50-persist.conf" <<EOF
-[Partition]
-Type=root
-Label=${persistence_label}
-Format=${filesystem}
-EOF
+   nums=()
+   ## Ensure partition labels are populated (a preceding sgdisk re-read may be
+   ## in flight).
+   udevadm settle || true
+   while read -r pn plabel; do
+      case "${plabel}" in
+         "${persistence_label}"|"${boot_label}")
+            if [ -n "${pn}" ]; then
+               nums+=( "${pn}" )
+            fi
+            ;;
+      esac
+   done < <(lsblk --noheadings --raw --output PARTN,PARTLABEL "${device}")
+
+   if [ "${#nums[@]}" -eq 0 ]; then
+      return 0
    fi
+   ## Delete highest-numbered first so earlier numbers stay valid.
+   while read -r pn; do
+      log_run notice sgdisk -d "${pn}" "${device}"
+   done < <(printf '%s\n' "${nums[@]}" | sort --numeric-sort --reverse)
+   partprobe "${device}" 2>/dev/null || true
+   udevadm settle || true
 }
 
-## Find the persistence partition device by its GPT partition label.
-find_persistence_partition() {
-   persistence_partition=''
+## Create the GPT partitions imperatively: boot (unencrypted, when encrypting)
+## then the persistence overlay filling the remaining free space.
+create_partitions() {
+   local pttype
+
+   if [ "${target}" = 'disk' ]; then
+      ## A blank or non-GPT disk needs a fresh GPT (never on usb-freespace -- it
+      ## already carries the isohybrid GPT we must preserve).
+      pttype="$(blkid -o value -s PTTYPE -- "${device}" 2>/dev/null || true)"
+      if [ "${pttype}" != 'gpt' ]; then
+         log_run notice sgdisk -o "${device}"
+      fi
+   fi
+
+   if [ "${encrypt}" = 'true' ]; then
+      log_run notice sgdisk -n "0:0:+${boot_size}" -t "0:${boot_type_guid}" \
+         -c "0:${boot_label}" "${device}"
+   fi
+   log_run notice sgdisk -n '0:0:0' -t "0:${persist_type_guid}" \
+      -c "0:${persistence_label}" "${device}"
+   partprobe "${device}" 2>/dev/null || true
    udevadm settle || true
+}
+
+## Echo the partition device carrying the given GPT partition label.
+partition_by_label() {
    ## --raw: plain names; the default tree output prefixes child NAMEs with
    ## tree-drawing characters (|- / `-) that corrupt the device path.
-   persistence_partition="$(lsblk --noheadings --raw --paths --output NAME,PARTLABEL "${device}" \
-      | awk -v l="${persistence_label}" '$2 == l { print $1; exit }')"
+   lsblk --noheadings --raw --paths --output NAME,PARTLABEL "${device}" \
+      | awk -v l="${1}" '$2 == l { print $1; exit }'
 }
 
-## Seed the OverlayFS upper + work dirs inside the persistence filesystem.
+## Seed the OverlayFS upper + work dirs on an already-formatted filesystem.
 seed_overlay_dirs() {
-   local fs_device mapper_name mount_dir
+   local fs_device mount_dir
 
-   fs_device="${persistence_partition}"
-   mapper_name=''
-   if [ "${encrypt}" = 'true' ]; then
-      mapper_name="persistence_setup_${$}"
-      cryptsetup luksOpen --key-file "${primary_key_file}" -- "${persistence_partition}" "${mapper_name}"
-      fs_device="/dev/mapper/${mapper_name}"
-   fi
-
+   fs_device="${1}"
    mount_dir="$(mktemp --directory)"
    log_run notice mount -- "${fs_device}" "${mount_dir}"
    log_run notice mkdir --parents -- "${mount_dir}/${overlay_dir}" "${mount_dir}/${overlay_workdir}"
    log_run notice umount -- "${mount_dir}"
    rmdir -- "${mount_dir}"
+}
 
-   if [ -n "${mapper_name}" ]; then
-      log_run notice cryptsetup luksClose "${mapper_name}"
+## Format + seed the persistence partition: LUKS2 (if encrypting) then the
+## filesystem, or the plain filesystem.
+provision_persistence_fs() {
+   local part fs_device
+
+   part="${1}"
+   log_run notice wipefs --all -- "${part}"
+
+   if [ "${encrypt}" = 'true' ]; then
+      log notice "Formatting LUKS2 (Argon2id) on '${part}'."
+      cryptsetup luksFormat --type luks2 --pbkdf argon2id --uuid "${luks_uuid}" \
+         --batch-mode --key-file "${primary_key_file}" -- "${part}"
+      if [ "${enroll_keyfile_extra}" = 'true' ]; then
+         log_run notice cryptsetup luksAddKey --batch-mode \
+            --key-file "${primary_key_file}" -- "${part}" "${keyfile}"
+      fi
+      if [ "${enroll_tpm}" = 'true' ]; then
+         log_run notice systemd-cryptenroll --unlock-key-file="${primary_key_file}" \
+            --tpm2-device=auto "${part}"
+      fi
+      open_mapper="persistence_setup_${$}"
+      cryptsetup luksOpen --key-file "${primary_key_file}" -- "${part}" "${open_mapper}"
+      fs_device="/dev/mapper/${open_mapper}"
+   else
+      fs_device="${part}"
+   fi
+
+   "mkfs.${filesystem}" -L "${persistence_label}" "${fs_device}"
+   seed_overlay_dirs "${fs_device}"
+
+   if [ -n "${open_mapper}" ]; then
+      log_run notice cryptsetup luksClose "${open_mapper}"
+      open_mapper=''
    fi
 }
 
 persistence_setup_cleanup() {
+   if [ -n "${open_mapper:-}" ] && [ -b "/dev/mapper/${open_mapper}" ]; then
+      cryptsetup luksClose "${open_mapper}" || true
+   fi
    if [ -n "${primary_key_file:-}" ] && [ "${primary_key_kind:-}" = 'password' ] \
       && [ -e "${primary_key_file}" ]; then
       shred --remove -- "${primary_key_file}" 2>/dev/null || safe-rm --force -- "${primary_key_file}"
    fi
-   if [ -n "${defdir:-}" ] && [ -d "${defdir}" ]; then
-      safe-rm --recursive --force -- "${defdir}"
-   fi
 }
 
 main() {
-   local device_opt reply existing_state node_fstype node_label candidate_disk \
-      cmdline_file
+   local device_opt existing_state node_fstype node_label candidate_disk \
+      cmdline_file device_type boot_partition persistence_partition
 
    ## Defaults + unset sentinels.
    target='usb-freespace'
@@ -323,6 +378,7 @@ main() {
    filesystem='ext4'
    allow_weak_passphrase='false'
    force='false'
+   luks_uuid="${default_luks_uuid}"
 
    while true; do
       begin_optparse "${1:-}" "${2:-}" || break
@@ -350,6 +406,10 @@ main() {
          keyfile)
             get_arg
             keyfile="${arg}"
+            ;;
+         luks-uuid)
+            get_arg
+            luks_uuid="${arg}"
             ;;
          f|filesystem)
             get_arg
@@ -397,17 +457,29 @@ main() {
       if [ "${has_password}" = 'true' ] && [ -z "${passphrase_file}" ]; then
          die 1 "--key-type password requires --passphrase-file (or '-' for stdin)."
       fi
-      if [ "${has_keyfile}" = 'true' ] && [ -z "${keyfile}" ]; then
-         die 1 "--key-type keyfile requires --keyfile."
+      if [ "${has_keyfile}" = 'true' ]; then
+         if [ -z "${keyfile}" ]; then
+            die 1 "--key-type keyfile requires --keyfile."
+         fi
+         if [ ! -r "${keyfile}" ]; then
+            die 1 "--keyfile '${keyfile}' is not readable."
+         fi
+         if [ ! -s "${keyfile}" ]; then
+            die 1 "--keyfile '${keyfile}' is empty; an empty key would be trivially guessable."
+         fi
       fi
-      if [ -n "${keyfile}" ] && [ ! -r "${keyfile}" ]; then
-         die 1 "--keyfile '${keyfile}' is not readable."
+      if ! [[ "${luks_uuid}" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]]; then
+         die 1 "--luks-uuid must be a UUID, got '${luks_uuid}'."
       fi
       plan_encryption
+      if [ "${encrypt}" = 'true' ]; then
+         persist_type_guid="${persist_type_guid_luks}"
+      fi
    else
       if [ -n "${key_type}" ] || [ -n "${passphrase_file}" ] || [ -n "${keyfile}" ]; then
          die 1 "--key-type/--passphrase-file/--keyfile are meaningless with --encrypt false."
       fi
+      persist_type_guid="${persist_type_guid_plain}"
    fi
 
    if [ "${target}" = 'disk' ] && [ -z "${device_opt}" ]; then
@@ -415,9 +487,9 @@ main() {
    fi
 
    ## --- preflight dependencies --------------------------------------------
-   die_if_not_has lsblk blkid sgdisk systemd-repart cryptsetup udevadm mount \
-      umount mktemp findmnt shred awk partprobe "mkfs.${filesystem}"
-   if [ "${has_tpm:-false}" = 'true' ]; then
+   die_if_not_has lsblk blkid sgdisk wipefs cryptsetup udevadm mount umount \
+      mktemp findmnt shred awk partprobe sort "mkfs.${filesystem}"
+   if [ "${enroll_tpm:-false}" = 'true' ]; then
       die_if_not_has systemd-cryptenroll
    fi
 
@@ -437,12 +509,13 @@ main() {
 
    ## --- resolve the target device -----------------------------------------
    device=''
+   boot_disk=''
+   resolve_boot_disk
    if [ "${target}" = 'usb-freespace' ]; then
       if [ -n "${device_opt}" ]; then
-         ## Explicit override (how the loop-device test drives usb-freespace).
+         ## Explicit override (also how the loop-device test drives usb-freespace).
          device="${device_opt}"
       else
-         resolve_boot_disk
          if [ -z "${boot_disk}" ]; then
             die 1 "could not resolve the booted USB device; pass --device explicitly."
          fi
@@ -466,6 +539,21 @@ main() {
    fi
    if [ ! -b "${device}" ]; then
       die 1 "'${device}' is not a block device."
+   fi
+   ## A whole disk, never a partition -- sgdisk operates on the disk, and
+   ## `sgdisk -e` on a partition would corrupt it.
+   device_type="$(lsblk --noheadings --nodeps --output TYPE -- "${device}" 2>/dev/null | head --lines 1 || true)"
+   case "${device_type}" in
+      disk|loop)
+         true "INFO: '${device}' is a whole disk, ok."
+         ;;
+      *)
+         die 1 "'${device}' is not a whole disk (type '${device_type}'); refusing."
+         ;;
+   esac
+   ## Never the boot disk under --target disk (that is what usb-freespace is for).
+   if [ "${target}" = 'disk' ] && [ -n "${boot_disk}" ] && [ "${device}" = "${boot_disk}" ]; then
+      die 1 "'${device}' is the booted live disk; use --target usb-freespace for it."
    fi
 
    ## --- refuse to clobber an existing overlay unless --force --------------
@@ -503,46 +591,49 @@ main() {
       make_primary_key_file
    fi
 
-   ## --- carve the partition(s) --------------------------------------------
+   ## --- carve + format ----------------------------------------------------
+   ## Delete the old overlay partitions BEFORE sgdisk -e: -e triggers a kernel
+   ## partition re-read whose udev events have not landed immediately after, so
+   ## reading PARTLABELs right after -e races empty.
+   if [ "${force}" = 'true' ]; then
+      delete_overlay_partitions
+   fi
    if [ "${target}" = 'usb-freespace' ]; then
-      ## Relocate the isohybrid backup-GPT header to the true device end so
-      ## repart sees the trailing free space.
+      ## Relocate the isohybrid backup-GPT header to the true device end so the
+      ## trailing free space becomes usable.
       log_run notice sgdisk -e "${device}"
    fi
+   create_partitions
 
-   assemble_repart_defs
-   repart_cmd=( systemd-repart --dry-run=no --definitions="${defdir}" )
-   if [ -n "${primary_key_file}" ]; then
-      repart_cmd+=( --key-file="${primary_key_file}" )
-   fi
-   repart_cmd+=( "${device}" )
-   log notice "Carving overlay on '${device}' via systemd-repart."
-   "${repart_cmd[@]}"
-   partprobe "${device}" 2>/dev/null || true
-
-   find_persistence_partition
+   persistence_partition="$(partition_by_label "${persistence_label}")"
    if [ -z "${persistence_partition}" ]; then
-      die 1 "could not locate the new '${persistence_label}' partition after repart."
+      die 1 "could not locate the new '${persistence_label}' partition."
    fi
-
-   ## --- post: deterministic LUKS UUID + extra keyslots --------------------
    if [ "${encrypt}" = 'true' ]; then
-      log_run notice cryptsetup luksUUID "${persistence_partition}" --uuid "${default_luks_uuid}"
-      if [ "${enroll_keyfile_extra}" = 'true' ]; then
-         log_run notice systemd-cryptenroll --unlock-key-file="${primary_key_file}" \
-            --unlock-type=luks2 "${persistence_partition}"
-         ## NOTE: enrolling the keyfile as an additional slot is pending
-         ## loop-device verification of the exact cryptenroll invocation.
+      boot_partition="$(partition_by_label "${boot_label}")"
+      if [ -z "${boot_partition}" ]; then
+         die 1 "could not locate the new '${boot_label}' partition."
       fi
+      log_run notice wipefs --all -- "${boot_partition}"
+      mkfs.ext4 -L "${boot_label}" "${boot_partition}"
    fi
 
-   seed_overlay_dirs
+   provision_persistence_fs "${persistence_partition}"
 
+   ## --- report ------------------------------------------------------------
    log notice "Done. '${device}' now carries a '${persistence_label}' overlay."
-   if [ "${encrypt}" = 'true' ]; then
-      log notice "Reboot and pick the LUKS persistence boot entry; systemd-cryptsetup prompts for the passphrase."
-   else
+   if [ "${encrypt}" != 'true' ]; then
       log notice "Reboot and pick the plaintext persistence boot entry."
+   else
+      if [ "${has_password}" = 'true' ]; then
+         log notice "At boot, systemd-cryptsetup prompts for the passphrase."
+      fi
+      if [ "${has_keyfile}" = 'true' ]; then
+         log notice "The keyfile unlocks the overlay (keep it available at boot)."
+      fi
+      if [ "${has_tpm}" = 'true' ]; then
+         log notice "A TPM2 slot was enrolled: it auto-unlocks on THIS machine only."
+      fi
    fi
 }
 
