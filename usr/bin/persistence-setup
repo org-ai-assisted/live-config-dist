@@ -129,36 +129,24 @@ resolve_boot_disk() {
    fi
 }
 
-## For --target disk: whole, unmounted, unheld disks only; the boot disk is
-## excluded by the caller.
-build_candidate_disk_list() {
-   local lsblk_line lsblk_disk_name lsblk_mounts_str sysfs_block_dir dev_is_held
-
-   candidate_disk_list=()
-   while read -r lsblk_line; do
-      dev_is_held='false'
-      read -r lsblk_disk_name lsblk_mounts_str <<< "${lsblk_line}"
-      if ! [[ "${lsblk_disk_name}" \
-         =~ ^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|nvme[0-9]+n[0-9]+|mmcblk[0-9]+)$ ]]; then
+## True if the disk (or any of its partitions) is claimed by another device
+## (dm/md/LUKS mapping) -- zapping a held disk would corrupt the active mapping.
+## Validates an explicit --target disk device by PROPERTY, so a legitimately
+## named disk (loop, mapper, vendor nvme quirk) is judged by what it IS, not by
+## a hard-coded name pattern.
+disk_is_held() {
+   local disk_name sysfs_block_dir
+   disk_name="${1#/dev/}"
+   ## The glob covers the disk and its partitions (sda, sda1, ...; loop1, loop1p1).
+   for sysfs_block_dir in "/sys/class/block/${disk_name}"*; do
+      if ! [ -d "${sysfs_block_dir}" ]; then
          continue
       fi
-      if [ -n "${lsblk_mounts_str}" ]; then
-         continue
+      if [ -n "$(find "${sysfs_block_dir}/holders" -mindepth 1 -maxdepth 1 2>&1)" ]; then
+         return 0
       fi
-      for sysfs_block_dir in "/sys/class/block/${lsblk_disk_name}"*; do
-         if ! [ -d "${sysfs_block_dir}" ]; then
-            continue
-         fi
-         if [ -n "$(find "${sysfs_block_dir}/holders" -mindepth 1 -maxdepth 1 2>&1)" ]; then
-            dev_is_held='true'
-            break
-         fi
-      done
-      if [ "${dev_is_held}" = 'true' ]; then
-         continue
-      fi
-      candidate_disk_list+=( "${lsblk_disk_name}" )
-   done < <(lsblk --raw --noheadings --output=NAME,MOUNTPOINTS)
+   done
+   return 1
 }
 
 ## Parse the comma-separated --key-type into has_password/has_keyfile/has_tpm.
@@ -378,9 +366,9 @@ persistence_setup_cleanup() {
 }
 
 main() {
-   local device_opt existing_state candidate_disk cmdline_file \
+   local device_opt existing_state cmdline_file \
       device_type boot_partition persistence_partition keyfile_size \
-      col_fstype col_partlabel col_label
+      col_fstype col_partlabel col_label device_mounts
 
    ## Defaults + unset sentinels.
    target='usb-freespace'
@@ -543,19 +531,8 @@ main() {
          device="${boot_disk}"
       fi
    else
-      candidate_disk_list=()
-      build_candidate_disk_list
-      device_opt_name="${device_opt#/dev/}"
-      device_ok='false'
-      for candidate_disk in "${candidate_disk_list[@]}"; do
-         if [ "${candidate_disk}" = "${device_opt_name}" ]; then
-            device_ok='true'
-            break
-         fi
-      done
-      if [ "${device_ok}" = 'false' ]; then
-         die 1 "'${device_opt}' is not an eligible whole, unmounted disk."
-      fi
+      ## --target disk requires an explicit --device (validated earlier); judge
+      ## it by PROPERTY below (whole disk, unmounted, unheld, not the boot disk).
       device="${device_opt}"
    fi
    if [ ! -b "${device}" ]; then
@@ -578,6 +555,17 @@ main() {
    if [ "${target}" = 'disk' ] && [ -n "${boot_disk}" ] \
       && [ "${device#/dev/}" = "${boot_disk#/dev/}" ]; then
       die 1 "'${device}' is the booted live disk; use --target usb-freespace for it."
+   fi
+   ## Refuse a --target disk that is mounted or claimed by another device: we
+   ## zap the whole disk, and a busy/held node cannot be re-read safely.
+   if [ "${target}" = 'disk' ]; then
+      device_mounts="$(lsblk --noheadings --raw --output MOUNTPOINT -- "${device}" | tr --delete '[:space:]')"
+      if [ -n "${device_mounts}" ]; then
+         die 1 "'${device}' has a mounted/in-use partition; unmount it before provisioning."
+      fi
+      if disk_is_held "${device}"; then
+         die 1 "'${device}' is held by another device (dm/md/LUKS); release it first."
+      fi
    fi
 
    ## --- refuse to clobber existing content unless --force -----------------
@@ -637,6 +625,13 @@ main() {
       ## --force above), so create always lands on empty, aligned free space --
       ## and it works on a DOS-labelled disk, which `sgdisk -o` refuses.
       log_run notice sgdisk --zap-all "${device}"
+      ## sgdisk self-triggers a kernel re-read, but it is REJECTED on a busy
+      ## device (printed as a warning, then ignored). If that happens a stale
+      ## pre-zap node survives and collides with the recreated same-named node,
+      ## so the create-time before/after diff is empty and we die after wiping.
+      ## Force the re-read + settle, matching every other sgdisk step here.
+      partprobe "${device}" 2>/dev/null || true
+      udevadm settle || true
    else
       ## usb-freespace: preserve the ISO partitions. On --force drop only OUR
       ## overlay partitions (BEFORE sgdisk -e, whose kernel re-read would race
