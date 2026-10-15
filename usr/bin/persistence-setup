@@ -47,9 +47,9 @@ source "${HELPER_SCRIPTS_PATH:-}"/usr/libexec/helper-scripts/password_strength.s
 source "${HELPER_SCRIPTS_PATH:-}"/usr/libexec/helper-scripts/persistent-boot.sh
 
 persistence_label='persistence'
-## Unencrypted boot area for the (future) updatable-boot feature: the signed grub
-## can read ext4 but NOT LUKS, so an encrypted overlay keeps its updatable
-## kernel+initrd+grub.cfg here. Carved only when encrypting; empty until used.
+## Always-carved unencrypted ext4 boot area: the signed grub reads ext4 but NOT
+## LUKS (and not necessarily the overlay's btrfs), so the updatable kernel+initrd+
+## grub.cfg live here. Holds the writable grub.cfg the ISO grub configfiles into.
 boot_label='persistbootx'
 boot_size='512M'
 overlay_dir='live/overlay'
@@ -70,6 +70,11 @@ default_luks_uuid='40e273d7-4e63-4459-b16f-ba3df4374905'
 ## Set by provision_persistence_fs while a LUKS mapping is open, so the EXIT trap
 ## can close it on any failure.
 open_mapper=''
+
+## Set by seed_writable_boot while the boot area is mounted, so the EXIT trap can
+## unmount it on any failure (otherwise a failed seed leaves it mounted and a
+## --force retry hits a busy device).
+seed_mount_dir=''
 
 usage() {
    printf '%s\n' "Usage: ${0##*/} --encrypt true|false [OPTIONS]
@@ -290,18 +295,19 @@ create_one_partition() {
    new_partition="$(comm -13 <(printf '%s\n' "${before}") <(printf '%s\n' "${after}") | head --lines 1)"
 }
 
-## Create the boot (when encrypting) + persistence partitions, capturing their
+## Create the persistbootx (always) + persistence partitions, capturing their
 ## exact new device nodes into boot_partition / persistence_partition.
 create_partitions() {
    boot_partition=''
    persistence_partition=''
 
-   if [ "${encrypt}" = 'true' ]; then
-      create_one_partition -n "0:0:+${boot_size}" -t "0:${boot_type_guid}" -c "0:${boot_label}"
-      boot_partition="${new_partition}"
-      if [ -z "${boot_partition}" ]; then
-         die 1 "could not identify the new '${boot_label}' partition."
-      fi
+   ## Always carve the unencrypted ext4 boot area, encrypted or not: the signed
+   ## grub reads ext4 but not LUKS (and not necessarily the overlay's btrfs), so
+   ## the updatable kernel+initrd+grub.cfg always live here.
+   create_one_partition -n "0:0:+${boot_size}" -t "0:${boot_type_guid}" -c "0:${boot_label}"
+   boot_partition="${new_partition}"
+   if [ -z "${boot_partition}" ]; then
+      die 1 "could not identify the new '${boot_label}' partition."
    fi
    create_one_partition -n '0:0:0' -t "0:${persist_type_guid}" -c "0:${persistence_label}"
    persistence_partition="${new_partition}"
@@ -326,12 +332,12 @@ seed_overlay_dirs() {
 ## the FIRST persistent boot: copy the current (ISO) signed kernel+initrd into a
 ## grub-readable boot partition and write its grub.cfg (the signed ISO grub
 ## search --label + configfile hands off to it). The kernel postinst hook later
-## adds upgraded kernels. $1 = the boot partition node (persistbootx when
-## encrypted; the plaintext persistence partition otherwise -- both ext4, which
-## grub reads; LUKS it cannot). Kernel source is the live medium's /live dir;
-## PERSISTENCE_SETUP_LIVE_KERNEL_DIR overrides it (tests, and unusual media).
+## adds upgraded kernels. $1 = the persistbootx partition node (always the
+## unencrypted ext4 boot area). Kernel source is the live medium's /live dir;
+## PERSISTENCE_SETUP_LIVE_KERNEL_DIR overrides it (tests, and unusual media). The
+## mount path is a GLOBAL so persistence_setup_cleanup unwinds it on any failure.
 seed_writable_boot() {
-   local boot_device kernel_src kver mount_dir boot_dir cmdline medium
+   local boot_device kernel_src kver boot_dir cmdline medium
    boot_device="${1}"
    kernel_src="${PERSISTENCE_SETUP_LIVE_KERNEL_DIR:-}"
    if [ -z "${kernel_src}" ]; then
@@ -347,20 +353,23 @@ seed_writable_boot() {
       die 1 "could not locate the live kernel+initrd to seed the boot area (looked in '${kernel_src:-/run/initramfs/live/live}'); set PERSISTENCE_SETUP_LIVE_KERNEL_DIR."
    fi
    kver="$(uname -r)"
-   mount_dir="$(mktemp --directory)"
-   log_run notice mount -- "${boot_device}" "${mount_dir}"
-   boot_dir="${mount_dir}/boot"
+   seed_mount_dir="$(mktemp --directory)"
+   log_run notice mount -- "${boot_device}" "${seed_mount_dir}"
+   boot_dir="${seed_mount_dir}/boot"
    log_run notice mkdir --parents -- "${boot_dir}"
-   log_run notice cp -- "${kernel_src}/vmlinuz" "${boot_dir}/vmlinuz-${kver}"
-   log_run notice cp -- "${kernel_src}/initrd.img" "${boot_dir}/initrd.img-${kver}"
+   ## --no-dereference: never follow a destination symlink (freshly formatted here,
+   ## but the hook reuses the same contract on an attacker-writable boot area).
+   log_run notice cp --no-dereference -- "${kernel_src}/vmlinuz" "${boot_dir}/vmlinuz-${kver}"
+   log_run notice cp --no-dereference -- "${kernel_src}/initrd.img" "${boot_dir}/initrd.img-${kver}"
    if [ "${encrypt}" = 'true' ]; then
       cmdline="$(persistent_boot_cmdline "${persistence_label}" "${luks_uuid}")"
    else
       cmdline="$(persistent_boot_cmdline "${persistence_label}")"
    fi
    persistent_boot_write_grub_cfg "${boot_dir}" "${cmdline}"
-   log_run notice umount -- "${mount_dir}"
-   rmdir -- "${mount_dir}"
+   log_run notice umount -- "${seed_mount_dir}"
+   rmdir -- "${seed_mount_dir}"
+   seed_mount_dir=''
 }
 
 ## Format + seed the persistence partition: LUKS2 (if encrypting) then the
@@ -400,6 +409,12 @@ provision_persistence_fs() {
 }
 
 persistence_setup_cleanup() {
+   if [ -n "${seed_mount_dir:-}" ] && mountpoint --quiet -- "${seed_mount_dir}" 2>/dev/null; then
+      umount -- "${seed_mount_dir}" 2>/dev/null || true
+   fi
+   if [ -n "${seed_mount_dir:-}" ] && [ -d "${seed_mount_dir}" ]; then
+      rmdir -- "${seed_mount_dir}" 2>/dev/null || true
+   fi
    if [ -n "${open_mapper:-}" ] && [ -b "/dev/mapper/${open_mapper}" ]; then
       cryptsetup luksClose "${open_mapper}" || true
    fi
@@ -537,8 +552,8 @@ main() {
 
    ## --- preflight dependencies --------------------------------------------
    die_if_not_has lsblk blkid sgdisk wipefs cryptsetup udevadm mount umount \
-      mktemp findmnt shred awk partprobe sort comm stat cp uname head cat \
-      "mkfs.${filesystem}"
+      mountpoint mktemp findmnt shred awk partprobe sort comm stat cp uname \
+      head cat "mkfs.${filesystem}"
    if [ "${encrypt}" = 'true' ]; then
       ## The unencrypted boot area is always ext4, regardless of --filesystem.
       die_if_not_has mkfs.ext4
@@ -691,20 +706,15 @@ main() {
    ## Captures the EXACT new nodes into persistence_partition / boot_partition.
    create_partitions
 
-   if [ "${encrypt}" = 'true' ]; then
-      log_run notice wipefs --all -- "${boot_partition}"
-      mkfs.ext4 -L "${boot_label}" "${boot_partition}"
-   fi
+   ## persistbootx is always ext4, regardless of --filesystem (grub-readable).
+   log_run notice wipefs --all -- "${boot_partition}"
+   mkfs.ext4 -L "${boot_label}" "${boot_partition}"
 
    provision_persistence_fs "${persistence_partition}"
 
-   ## Seed the writable boot area (persistbootx when encrypted, else the plaintext
-   ## persistence partition) so the updatable-kernel path is live from boot 1.
-   if [ "${encrypt}" = 'true' ]; then
-      seed_writable_boot "${boot_partition}"
-   else
-      seed_writable_boot "${persistence_partition}"
-   fi
+   ## Seed the writable boot area (always the unencrypted ext4 persistbootx) so
+   ## the updatable-kernel path is live from boot 1.
+   seed_writable_boot "${boot_partition}"
 
    ## --- report ------------------------------------------------------------
    log notice "Done. '${device}' now carries a '${persistence_label}' overlay."
