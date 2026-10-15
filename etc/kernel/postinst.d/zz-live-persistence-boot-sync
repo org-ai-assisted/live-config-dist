@@ -44,9 +44,10 @@ boot_label='persistbootx'
 cmdline_file="${PERSISTENT_BOOT_CMDLINE_FILE:-/proc/cmdline}"
 
 ## Gate FIRST, before sourcing anything: only a persistent-overlay live boot has
-## a boot area to maintain.
+## a boot area to maintain. The trailing ':' anchors to the exact label token
+## (LABEL=<label>:<path>), so 'persistence' does not also match 'persistence-old'.
 if [ ! -r "${cmdline_file}" ] \
-   || ! grep --quiet -- "rd.live.overlay=LABEL=${persistence_label}" "${cmdline_file}"; then
+   || ! grep --quiet --fixed-strings -- "rd.live.overlay=LABEL=${persistence_label}:" "${cmdline_file}"; then
    exit 0
 fi
 
@@ -111,18 +112,22 @@ sync_boot_area() {
    boot_dir="${seed_mount_dir}/boot"
    mkdir --parents -- "${boot_dir}" || return 1
 
+   ## Prune kernels no longer installed FIRST, so a boot area full of stale images
+   ## frees space before the copy (otherwise the copy ENOSPCs and the prune that
+   ## would have freed room is never reached -- a permanent wedge).
+   persistent_boot_prune "${boot_dir}" "${kernel_src_dir}"
+
    ## Copy to a temp name then atomically rename, so an interrupted or ENOSPC copy
-   ## never leaves a truncated image under a live filename. --no-dereference: a
-   ## destination symlink planted on this unencrypted fs is not followed.
+   ## never leaves a truncated image under a live filename. --dereference: copy a
+   ## source symlink's CONTENT (live media's vmlinuz is a symlink), not a dangling
+   ## link. --remove-destination: replace a planted destination symlink on this
+   ## unencrypted fs rather than writing THROUGH it (root arbitrary-overwrite).
    tmp_kernel="${boot_dir}/.vmlinuz-${kernel_version}.new"
    tmp_initrd="${boot_dir}/.initrd.img-${kernel_version}.new"
-   cp --no-dereference --force -- "${kernel_src_dir}/vmlinuz-${kernel_version}" "${tmp_kernel}" || return 1
-   cp --no-dereference --force -- "${kernel_src_dir}/initrd.img-${kernel_version}" "${tmp_initrd}" || return 1
+   cp --dereference --remove-destination -- "${kernel_src_dir}/vmlinuz-${kernel_version}" "${tmp_kernel}" || return 1
+   cp --dereference --remove-destination -- "${kernel_src_dir}/initrd.img-${kernel_version}" "${tmp_initrd}" || return 1
    mv --force -- "${tmp_kernel}" "${boot_dir}/vmlinuz-${kernel_version}" || return 1
    mv --force -- "${tmp_initrd}" "${boot_dir}/initrd.img-${kernel_version}" || return 1
-
-   ## Drop kernels no longer installed, so the small boot area does not fill up.
-   persistent_boot_prune "${boot_dir}" "${kernel_src_dir}"
 
    cmdline="$(persistent_boot_cmdline "${persistence_label}" "${luks_uuid}")" || return 1
    persistent_boot_write_grub_cfg "${boot_dir}" "${cmdline}" || return 1

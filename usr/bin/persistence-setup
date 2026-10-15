@@ -357,10 +357,11 @@ seed_writable_boot() {
    log_run notice mount -- "${boot_device}" "${seed_mount_dir}"
    boot_dir="${seed_mount_dir}/boot"
    log_run notice mkdir --parents -- "${boot_dir}"
-   ## --no-dereference: never follow a destination symlink (freshly formatted here,
-   ## but the hook reuses the same contract on an attacker-writable boot area).
-   log_run notice cp --no-dereference -- "${kernel_src}/vmlinuz" "${boot_dir}/vmlinuz-${kver}"
-   log_run notice cp --no-dereference -- "${kernel_src}/initrd.img" "${boot_dir}/initrd.img-${kver}"
+   ## --dereference: the live medium's vmlinuz/initrd.img may be symlinks; copy
+   ## their CONTENT (not a dangling link). --remove-destination: replace a
+   ## destination entry (incl. a symlink) rather than writing through it.
+   log_run notice cp --dereference --remove-destination -- "${kernel_src}/vmlinuz" "${boot_dir}/vmlinuz-${kver}"
+   log_run notice cp --dereference --remove-destination -- "${kernel_src}/initrd.img" "${boot_dir}/initrd.img-${kver}"
    if [ "${encrypt}" = 'true' ]; then
       cmdline="$(persistent_boot_cmdline "${persistence_label}" "${luks_uuid}")"
    else
@@ -554,10 +555,9 @@ main() {
    die_if_not_has lsblk blkid sgdisk wipefs cryptsetup udevadm mount umount \
       mountpoint mktemp findmnt shred awk partprobe sort comm stat cp uname \
       head cat "mkfs.${filesystem}"
-   if [ "${encrypt}" = 'true' ]; then
-      ## The unencrypted boot area is always ext4, regardless of --filesystem.
-      die_if_not_has mkfs.ext4
-   fi
+   ## persistbootx is always carved and always ext4, regardless of --filesystem,
+   ## so mkfs.ext4 is always required -- preflight it before touching any disk.
+   die_if_not_has mkfs.ext4
    if [ "${enroll_tpm:-false}" = 'true' ]; then
       die_if_not_has systemd-cryptenroll
    fi
