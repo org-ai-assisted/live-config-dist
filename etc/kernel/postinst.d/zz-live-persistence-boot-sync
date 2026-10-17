@@ -1,0 +1,164 @@
+#!/bin/bash
+
+## Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+## See the file COPYING for copying conditions.
+
+## AI-Assisted
+
+set -o errexit
+set -o nounset
+set -o pipefail
+set -o errtrace
+shopt -s inherit_errexit
+shopt -s shift_verbose
+export LC_ALL=C
+
+## Kernel postinst.d hook. Under a persistent live overlay, the signed ISO grub
+## boots an UPGRADED kernel only if it lives on the unencrypted, grub-readable
+## 'persistbootx' ext4 partition with a matching grub.cfg. After a kernel install
+## this hook copies the just-installed signed kernel+initrd there and rewrites
+## that grub.cfg. Supersedes the former warn-only hook.
+##
+## The 'zz-' prefix is load-bearing: run-parts executes /etc/kernel/postinst.d/*
+## in C-locale byte order, and the initrd is built by the 'dracut' (or
+## 'initramfs-tools') hook -- both sort BEFORE 'zz', so by the time this runs the
+## new initrd exists in /boot.
+##
+## Gate: the overlay token on the kernel cmdline. A WHOLE-root overlay makes
+## live-mode.sh report 'not live' (it looks like an install), so live-mode.sh
+## cannot gate this; the cmdline token is the direct, reliable signal and also
+## excludes installed-to-disk and amnesic-live systems (no token -> no-op).
+##
+## BEST-EFFORT: any failure WARNS loudly but never aborts the kernel upgrade (a
+## half-configured dpkg state is worse than a stale boot menu). The gate and the
+## helper-presence guard run BEFORE sourcing, so a non-persistent system -- or a
+## transient window without the helper -- never risks the upgrade.
+
+kernel_version="${1:-}"
+helper_scripts_path="${HELPER_SCRIPTS_PATH:-}"
+## Where the just-installed kernel+initrd live (dpkg puts them in /boot).
+## Overridable for tests; production is /boot.
+kernel_src_dir="${LIVE_PERSISTENCE_KERNEL_SRC:-/boot}"
+persistence_label='persistence'
+boot_label='persistbootx'
+cmdline_file="${PERSISTENT_BOOT_CMDLINE_FILE:-/proc/cmdline}"
+
+## Gate FIRST, before sourcing anything: only a persistent-overlay live boot has
+## a boot area to maintain. Match the label as a whole token -- followed by ':'
+## (the optional dracut subpath), whitespace, or end -- so the pathless dracut
+## form 'rd.live.overlay=LABEL=persistence' is accepted while 'persistence-old'
+## is not.
+if [ ! -r "${cmdline_file}" ] \
+   || ! grep --quiet --extended-regexp -- "rd[.]live[.]overlay=LABEL=${persistence_label}(:|[[:space:]]|\$)" "${cmdline_file}"; then
+   exit 0
+fi
+
+if [ -z "${kernel_version}" ]; then
+   printf '%s\n' "live-persistence boot sync: no kernel version argument; skipping." >&2
+   exit 0
+fi
+
+## helper-scripts is a hard Depends, but a transient upgrade window (new
+## live-config-dist, old helper-scripts) could lack this file. Guard so a missing
+## helper WARNS rather than aborting the kernel upgrade.
+persistent_boot_lib="${helper_scripts_path}/usr/libexec/helper-scripts/persistent-boot.sh"
+if [ ! -r "${persistent_boot_lib}" ]; then
+   printf '%s\n' "WARNING: live-persistence boot sync: '${persistent_boot_lib}' missing; kernel ${kernel_version} not synced." >&2
+   exit 0
+fi
+# shellcheck source=../../../../helper-scripts/usr/libexec/helper-scripts/persistent-boot.sh
+source "${persistent_boot_lib}"
+
+seed_mount_dir=''
+## Invoked via the EXIT trap, which shellcheck does not see as a call (SC2317).
+# shellcheck disable=SC2317
+boot_sync_cleanup() {
+   if [ -n "${seed_mount_dir}" ] && mountpoint --quiet -- "${seed_mount_dir}" 2>/dev/null; then
+      umount -- "${seed_mount_dir}" 2>/dev/null || true
+   fi
+   if [ -n "${seed_mount_dir}" ] && [ -d "${seed_mount_dir}" ]; then
+      rmdir -- "${seed_mount_dir}" 2>/dev/null || true
+   fi
+}
+trap boot_sync_cleanup EXIT
+
+sync_boot_area() {
+   local boot_dev luks_uuid luks_rc cmdline boot_dir tmp_kernel tmp_initrd copy_ok
+
+   ## Resolve persistbootx on the BOOTED stick (never a second device, never the
+   ## open LUKS mapper, which has no GPT PARTLABEL).
+   boot_dev="$(persistent_boot_device "${boot_label}")"
+   if [ -z "${boot_dev}" ]; then
+      printf '%s\n' "live-persistence boot sync: no '${boot_label}' partition on the booted disk." >&2
+      return 1
+   fi
+
+   ## Encrypted iff the cmdline carries a VALID rd.luks.uuid. A present-but-
+   ## malformed uuid is refused -- never write a broken (and grub-injectable)
+   ## cmdline. Absent (plaintext) -> empty uuid, which is correct.
+   luks_rc=0
+   luks_uuid="$(persistent_boot_luks_uuid)" || luks_rc=$?
+   if [ "${luks_rc}" -eq 2 ]; then
+      printf '%s\n' "live-persistence boot sync: malformed rd.luks.uuid on the cmdline; refusing." >&2
+      return 1
+   fi
+
+   if [ ! -e "${kernel_src_dir}/vmlinuz-${kernel_version}" ] \
+      || [ ! -e "${kernel_src_dir}/initrd.img-${kernel_version}" ]; then
+      printf '%s\n' "live-persistence boot sync: ${kernel_src_dir}/{vmlinuz,initrd.img}-${kernel_version} missing." >&2
+      return 1
+   fi
+
+   seed_mount_dir="$(mktemp --directory)" || return 1
+   mount -- "${boot_dev}" "${seed_mount_dir}" || return 1
+   ## Refuse a planted 'boot' symlink on this unencrypted fs before any write, so a
+   ## 'boot -> /etc' cannot redirect the copies below onto the live root fs.
+   boot_dir="$(persistent_boot_safe_boot_dir "${seed_mount_dir}")" || return 1
+
+   ## Prune kernels no longer installed FIRST, so a boot area full of stale images
+   ## frees space before the copy (otherwise the copy ENOSPCs and the prune that
+   ## would have freed room is never reached -- a permanent wedge).
+   persistent_boot_prune "${boot_dir}" "${kernel_src_dir}"
+
+   ## Stage to a temp name then atomically rename, so an interrupted/ENOSPC copy
+   ## never leaves a truncated image under a live filename. --dereference: copy a
+   ## source symlink's CONTENT (live media's vmlinuz is a symlink), not a dangling
+   ## link. --remove-destination + --no-target-directory: replace a planted
+   ## destination symlink (incl. one pointing at a directory) on this unencrypted
+   ## fs rather than writing THROUGH it (root arbitrary-overwrite). Best-effort:
+   ## a copy failure is recorded, not early-returned, so grub.cfg is still
+   ## regenerated below to match what is ACTUALLY present (never a stale pointer).
+   copy_ok='true'
+   tmp_kernel="${boot_dir}/.vmlinuz-${kernel_version}.new"
+   tmp_initrd="${boot_dir}/.initrd.img-${kernel_version}.new"
+   cp --dereference --remove-destination --no-target-directory -- "${kernel_src_dir}/vmlinuz-${kernel_version}" "${tmp_kernel}" || copy_ok='false'
+   cp --dereference --remove-destination --no-target-directory -- "${kernel_src_dir}/initrd.img-${kernel_version}" "${tmp_initrd}" || copy_ok='false'
+   if [ "${copy_ok}" = 'true' ]; then
+      mv --force --no-target-directory -- "${tmp_kernel}" "${boot_dir}/vmlinuz-${kernel_version}" || copy_ok='false'
+      mv --force --no-target-directory -- "${tmp_initrd}" "${boot_dir}/initrd.img-${kernel_version}" || copy_ok='false'
+   fi
+   safe-rm --force -- "${tmp_kernel}" "${tmp_initrd}" 2>/dev/null || true
+
+   ## Regenerate grub.cfg from ACTUAL contents regardless of the copy outcome, so
+   ## it never points at a kernel that was pruned but not replaced (clears the
+   ## cfg entirely if nothing remains -> ISO grub falls through to amnesic).
+   cmdline="$(persistent_boot_cmdline "${persistence_label}" "${luks_uuid}")" || cmdline=''
+   if [ -n "${cmdline}" ]; then
+      persistent_boot_write_grub_cfg "${boot_dir}" "${cmdline}" || true
+   fi
+
+   umount -- "${seed_mount_dir}" || true
+   rmdir -- "${seed_mount_dir}" 2>/dev/null || true
+   seed_mount_dir=''
+   if [ "${copy_ok}" != 'true' ]; then
+      return 1
+   fi
+   return 0
+}
+
+if sync_boot_area; then
+   printf '%s\n' "live-persistence boot sync: kernel ${kernel_version} synced to the persistent boot area." >&2
+else
+   printf '%s\n' "WARNING: live-persistence boot sync FAILED for kernel ${kernel_version}; re-sync before relying on the upgraded kernel." >&2
+fi
+exit 0
