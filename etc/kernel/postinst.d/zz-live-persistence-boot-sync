@@ -111,8 +111,9 @@ sync_boot_area() {
 
    seed_mount_dir="$(mktemp --directory)" || return 1
    mount -- "${boot_dev}" "${seed_mount_dir}" || return 1
-   boot_dir="${seed_mount_dir}/boot"
-   mkdir --parents -- "${boot_dir}" || return 1
+   ## Refuse a planted 'boot' symlink on this unencrypted fs before any write, so a
+   ## 'boot -> /etc' cannot redirect the copies below onto the live root fs.
+   boot_dir="$(persistent_boot_safe_boot_dir "${seed_mount_dir}")" || return 1
 
    ## Prune kernels no longer installed FIRST, so a boot area full of stale images
    ## frees space before the copy (otherwise the copy ENOSPCs and the prune that

@@ -116,23 +116,30 @@ Other:
    exit "${1}"
 }
 
-## usb-freespace: resolve the whole disk the live medium booted from.
+## usb-freespace: resolve the whole disk the live medium booted from. The dracut
+## dmsquash-live medium is mounted at /run/initramfs/live; its SOURCE is the
+## medium itself (an isohybrid's iso9660 lives on the WHOLE device, so PKNAME is
+## empty and the disk IS the source) or, if the medium is a partition, its parent
+## disk. /run/rootfsbase is the squashfs LOOP, never the stick, so it is not a
+## fallback here.
 resolve_boot_disk() {
-   local live_src parent
+   local live_src parent src_type
 
    boot_disk=''
-   ## The dracut dmsquash-live medium is mounted here; its backing partition's
-   ## parent is the stick.
-   live_src="$(findmnt --noheadings --output SOURCE --target /run/initramfs/live 2>/dev/null || true)"
-   if [ -z "${live_src}" ]; then
-      live_src="$(findmnt --noheadings --output SOURCE --target /run/rootfsbase 2>/dev/null || true)"
-   fi
+   live_src="$(findmnt --noheadings --first-only --nofsroot --output SOURCE --target /run/initramfs/live 2>/dev/null)" || live_src=''
    if [ -z "${live_src}" ]; then
       return 0
    fi
-   parent="$(lsblk --noheadings --output PKNAME --paths "${live_src}" 2>/dev/null | head --lines 1 || true)"
+   parent="$(lsblk --noheadings --output PKNAME --paths "${live_src}" 2>/dev/null | head --lines 1)" || parent=''
    if [ -n "${parent}" ]; then
       boot_disk="${parent}"
+      return 0
+   fi
+   ## No parent: the medium is a whole device (the common isohybrid case). Accept
+   ## it only if it really is a whole disk, never some other sourceless node.
+   src_type="$(lsblk --noheadings --nodeps --output TYPE "${live_src}" 2>/dev/null | head --lines 1)" || src_type=''
+   if [ "${src_type}" = 'disk' ]; then
+      boot_disk="${live_src}"
    fi
 }
 
@@ -355,8 +362,10 @@ seed_writable_boot() {
    kver="$(uname -r)"
    seed_mount_dir="$(mktemp --directory)"
    log_run notice mount -- "${boot_device}" "${seed_mount_dir}"
-   boot_dir="${seed_mount_dir}/boot"
-   log_run notice mkdir --parents -- "${boot_dir}"
+   ## Refuse a planted 'boot' symlink before any write (shared chokepoint), so the
+   ## seed copies below cannot resolve THROUGH it onto the live root fs.
+   boot_dir="$(persistent_boot_safe_boot_dir "${seed_mount_dir}")" \
+      || die 1 "refusing to seed through a planted 'boot' symlink on '${seed_mount_dir}'."
    ## --dereference: the live medium's vmlinuz/initrd.img may be symlinks; copy
    ## their CONTENT (not a dangling link). --remove-destination: replace a
    ## destination entry (incl. a symlink) rather than writing through it.
@@ -373,13 +382,31 @@ seed_writable_boot() {
    seed_mount_dir=''
 }
 
+## wipefs a freshly-created partition, waiting out the udev blkid probe that the
+## create's table re-read triggers: wipefs opens the device O_EXCL, so a probe
+## still in flight makes it fail "Device or resource busy" on a live system.
+## Settle, then retry a few times before giving up.
+wipefs_settle() {
+   local dev
+   dev="${1}"
+   for _ in 1 2 3 4 5 6; do
+      udevadm settle 2>/dev/null || true
+      if wipefs --all -- "${dev}" >/dev/null 2>&1; then
+         return 0
+      fi
+      sleep 1
+   done
+   die 1 "wipefs kept failing on '${dev}' (device stayed busy after settle+retries)."
+}
+
 ## Format + seed the persistence partition: LUKS2 (if encrypting) then the
 ## filesystem, or the plain filesystem.
 provision_persistence_fs() {
    local part fs_device
 
    part="${1}"
-   log_run notice wipefs --all -- "${part}"
+   log notice "wiping filesystem signatures on '${part}'."
+   wipefs_settle "${part}"
 
    if [ "${encrypt}" = 'true' ]; then
       log notice "Formatting LUKS2 (Argon2id) on '${part}'."
@@ -707,7 +734,8 @@ main() {
    create_partitions
 
    ## persistbootx is always ext4, regardless of --filesystem (grub-readable).
-   log_run notice wipefs --all -- "${boot_partition}"
+   log notice "wiping filesystem signatures on '${boot_partition}'."
+   wipefs_settle "${boot_partition}"
    mkfs.ext4 -L "${boot_label}" "${boot_partition}"
 
    provision_persistence_fs "${persistence_partition}"
