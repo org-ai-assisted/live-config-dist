@@ -62,6 +62,15 @@ mok_enroll_opt_in() {
    mok_pub_state='MISSING'
    if [ -f "${dkms_mok_public_file}" ]; then
       mok_pub_state='present'
+      ## Mark this as a LEGITIMATE install-generated per-machine MOK so the
+      ## build-time-leaked-key guard (helper-scripts check-image-builtin-mok) does
+      ## NOT flag it for deletion by legacy-dist on first boot. That guard returns
+      ## early when this flag exists; WITHOUT it the freshly generated MOK is
+      ## misclassified as a baked-in image leak and DELETED before it can be
+      ## enrolled -- stranding Secure Boot signing of tirdad + the GA modules.
+      mkdir --parents -- /var/lib/legacy-dist/do_once
+      touch -- /var/lib/legacy-dist/do_once/mok-ok
+      mok_log "dropped legacy-dist mok-ok flag (protect install-generated MOK from deletion)"
    fi
    mok_log "done: mok.pub ${mok_pub_state}"
    printf '%s\n' "$0: done; public cert for enrollment is at ${dkms_mok_public_file}."
