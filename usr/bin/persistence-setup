@@ -283,7 +283,7 @@ delete_overlay_partitions() {
             fi
             ;;
       esac
-   done < <(lsblk --noheadings --raw --paths --output PATH,PARTN,PARTLABEL "${device}")
+   done < <(lsblk --noheadings --raw --paths --output NAME,PARTN,PARTLABEL "${device}")
 
    if [ "${#nums[@]}" -eq 0 ]; then
       return 0
