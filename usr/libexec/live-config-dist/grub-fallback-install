@@ -49,8 +49,11 @@ if pkg_installed "grub-efi-${system_arch}"; then
       exit "${reconfigure_rc}"
    fi
 
-   ## grub-efi's postinst emits a warning when GRUB installaiont fails, but we
-   ## want to treat this as fatal.
+   ## grub-efi's postinst only WARNS when grub-install fails; we treat it as fatal.
+   ## Deliberately strict: ANY grub-install failure aborts, even when
+   ## --force-extra-removable already copied the removable shim and only the NVRAM
+   ## registration failed. A security distro prefers a hard abort over a silently
+   ## degraded boot path.
    case "${reconfigure_output}" in
       *"Failed: grub-install"*)
          printf '%s\n' "$0: ERROR: grub-install failed inside the grub-efi-${system_arch} postinst!" >&2

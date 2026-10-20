@@ -47,12 +47,30 @@ mok_enroll_opt_in() {
    printf '%s\n' "$0: MOK_ENROLL set and EFI detected; creating MOK and signing out-of-tree modules."
    shim-signed-mok-setup
    rebuild-dkms-modules
-   ## Oracle VirtualBox Guest Additions modules are built outside DKMS.
-   vbox-guest-installer
+   ## VirtualBox Guest Additions modules are built outside DKMS, so
+   ## rebuild-dkms-modules does not sign them; vbox-guest-installer (vm-config-dist)
+   ## rebuilds + signs them against the new MOK. It ships only on VirtualBox guests;
+   ## on a bare-metal / KVM EFI install it is absent and GA signing is not applicable,
+   ## so skip it -- aborting here would strand an otherwise-complete MOK setup.
+   if type -P vbox-guest-installer >/dev/null 2>&1; then
+      vbox-guest-installer
+   else
+      mok_log "skip: vbox-guest-installer absent (GA signing not applicable)"
+      printf '%s\n' "$0: vbox-guest-installer not present; skipping VirtualBox GA module signing."
+   fi
 
    mok_pub_state='MISSING'
    if [ -f "${dkms_mok_public_file}" ]; then
       mok_pub_state='present'
+      ## Mark this as a LEGITIMATE install-generated per-machine MOK so the
+      ## build-time-leaked-key guard (helper-scripts check-image-builtin-mok) does
+      ## NOT flag it for deletion by legacy-dist on first boot. That guard returns
+      ## early when this flag exists; WITHOUT it the freshly generated MOK is
+      ## misclassified as a baked-in image leak and DELETED before it can be
+      ## enrolled -- stranding Secure Boot signing of tirdad + the GA modules.
+      mkdir --parents -- /var/lib/legacy-dist/do_once
+      touch -- /var/lib/legacy-dist/do_once/mok-ok
+      mok_log "dropped legacy-dist mok-ok flag (protect install-generated MOK from deletion)"
    fi
    mok_log "done: mok.pub ${mok_pub_state}"
    printf '%s\n' "$0: done; public cert for enrollment is at ${dkms_mok_public_file}."
