@@ -164,6 +164,23 @@ disk_is_held() {
    return 1
 }
 
+## True if a partition node is mounted (itself or via a child mapper) or held by
+## an open LUKS/dm mapping. MOUNTPOINT over the partition subtree catches a
+## mounted overlay (plain or LUKS-mapped); disk_is_held catches an open-but-
+## unmounted mapping. Used to refuse deleting an in-use overlay partition.
+overlay_partition_busy() {
+   local part mnt
+   part="${1}"
+   mnt="$(lsblk --noheadings --output MOUNTPOINT -- "${part}" 2>/dev/null | tr --delete '[:space:]')"
+   if [ -n "${mnt}" ]; then
+      return 0
+   fi
+   if disk_is_held "${part}"; then
+      return 0
+   fi
+   return 1
+}
+
 ## Parse the comma-separated --key-type into has_password/has_keyfile/has_tpm.
 parse_key_type() {
    local csv token
@@ -249,26 +266,38 @@ make_primary_key_file() {
 
 ## --force: delete the existing overlay partitions so they are recreated fresh.
 delete_overlay_partitions() {
-   local -a nums
-   local pn plabel
+   local -a nums paths
+   local pn plabel ppath
 
    nums=()
+   paths=()
    ## Ensure partition labels are populated (a preceding sgdisk re-read may be
    ## in flight).
    udevadm settle || true
-   while read -r pn plabel; do
+   while read -r ppath pn plabel; do
       case "${plabel}" in
          "${persistence_label}"|"${boot_label}")
             if [ -n "${pn}" ]; then
                nums+=( "${pn}" )
+               paths+=( "${ppath}" )
             fi
             ;;
       esac
-   done < <(lsblk --noheadings --raw --output PARTN,PARTLABEL "${device}")
+   done < <(lsblk --noheadings --raw --paths --output PATH,PARTN,PARTLABEL "${device}")
 
    if [ "${#nums[@]}" -eq 0 ]; then
       return 0
    fi
+   ## Refuse to delete an overlay partition that is still mounted or held (an open
+   ## LUKS mapping, or the overlay backing the running live system): a busy
+   ## partition's table entry cannot be re-read after deletion, so recreation
+   ## fails AFTER the entries are already gone and the stick loses its overlay with
+   ## nothing to restore. Check every one FIRST, delete none if any is busy.
+   for ppath in "${paths[@]}"; do
+      if overlay_partition_busy "${ppath}"; then
+         die 1 "refusing --force reformat: overlay partition '${ppath}' is mounted or held (in use by the running system?); unmount/close it first."
+      fi
+   done
    ## Delete highest-numbered first so earlier numbers stay valid.
    while read -r pn; do
       log_run notice sgdisk -d "${pn}" "${device}"
