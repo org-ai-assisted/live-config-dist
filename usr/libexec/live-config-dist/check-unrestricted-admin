@@ -3,11 +3,6 @@
 ## Copyright (C) 2024 - 2025 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
 ## See the file COPYING for copying conditions.
 
-## Hardened strict-mode style below (errexit/nounset/errtrace/pipefail,
-## inherit_errexit, shift_verbose, LC_ALL=C, printf, explicit SC2076 disables)
-## is deliberate. On an upstream absorb or remaster conflict in this file, keep
-## ours; do NOT reset to the upstream echo / non-strict variant.
-
 set -o errexit
 set -o nounset
 set -o errtrace

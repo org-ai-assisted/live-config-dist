@@ -1,0 +1,94 @@
+#!/bin/bash
+
+## Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+## See the file COPYING for copying conditions.
+
+## AI-Assisted
+
+## Updates boot files and configuration for ISO persistent systems when a
+## kernel update occurs.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+set -o errtrace
+shopt -s inherit_errexit
+shopt -s shift_verbose
+export LC_ALL=C
+
+kernel_src_dir="${LIVE_PERSISTENCE_KERNEL_SRC:-/boot}"
+persistence_label='persistence'
+boot_label='persistbootx'
+cmdline_file="${PERSISTENT_BOOT_CMDLINE_FILE:-/proc/cmdline}"
+
+## If no persistence overlay is active, exit.
+if [ ! -r "${cmdline_file}" ] \
+   || ! grep --quiet --extended-regexp -- "rd[.]live[.]overlay=LABEL=${persistence_label}(:|[[:space:]]|\$)" "${cmdline_file}"; then
+   exit 0
+fi
+
+## File might be missing mid-upgrade in theory.
+persistent_boot_lib="${HELPER_SCRIPTS_PATH:-}/usr/libexec/helper-scripts/persistent-boot.sh"
+if [ ! -r "${persistent_boot_lib}" ]; then
+   printf '%s\n' "WARNING: live-persistence boot sync: '${persistent_boot_lib}' missing, kernels not synced." >&2
+   exit 0
+fi
+# shellcheck source=../../../../helper-scripts/usr/libexec/helper-scripts/persistent-boot.sh
+source "${persistent_boot_lib}"
+
+seed_mount_dir=''
+# shellcheck disable=SC2317
+boot_sync_cleanup() {
+   if [ -n "${seed_mount_dir}" ] && mountpoint --quiet -- "${seed_mount_dir}"; then
+      umount -- "${seed_mount_dir}" 2>/dev/null || true
+   fi
+   if [ -n "${seed_mount_dir}" ] && [ -d "${seed_mount_dir}" ]; then
+      rmdir -- "${seed_mount_dir}" 2>/dev/null || true
+   fi
+}
+trap boot_sync_cleanup EXIT
+
+sync_boot_area() {
+   local boot_dev luks_uuid luks_rc cmdline boot_dir install_exit_code
+
+   boot_dev="$(persistent_boot_device "${boot_label}")"
+   if [ -z "${boot_dev}" ]; then
+      printf '%s\n' "live-persistence boot sync: no '${boot_label}' partition found." >&2
+      return 1
+   fi
+
+   luks_rc=0
+   luks_uuid="$(persistent_boot_luks_uuid)" || luks_rc=$?
+   if [ "${luks_rc}" -eq 2 ]; then
+      printf '%s\n' "live-persistence boot sync: malformed rd.luks.uuid in the cmdline, refusing." >&2
+      return 1
+   fi
+
+   seed_mount_dir="$(mktemp --directory)" || return 1
+   mount -- "${boot_dev}" "${seed_mount_dir}" || return 1
+   boot_dir="$(persistent_boot_safe_boot_dir "${seed_mount_dir}")" || return 1
+
+   persistent_boot_prune "${boot_dir}" "${kernel_src_dir}"
+   install_exit_code=0
+   persistent_boot_install "${boot_dir}" "${kernel_src_dir}" || install_exit_code="$?"
+
+   ## Always regenerate the GRUB config, kernels may have been pruned.
+   cmdline="$(persistent_boot_cmdline "${persistence_label}" "${luks_uuid}")" || cmdline=''
+   if [ -n "${cmdline}" ]; then
+      persistent_boot_write_grub_cfg "${boot_dir}" "${cmdline}" || true
+   fi
+
+   ## Cleanup is the responsibility of the boot_sync_cleanup trap.
+
+   if [ "${install_exit_code}" -ne 0 ]; then
+      return 1
+   fi
+   return 0
+}
+
+if sync_boot_area; then
+   printf '%s\n' "live-persistence boot sync: kernel ${kernel_version} synced to the persistent boot area." >&2
+else
+   printf '%s\n' "WARNING: live-persistence boot sync FAILED for kernel ${kernel_version}." >&2
+fi
+exit 0
