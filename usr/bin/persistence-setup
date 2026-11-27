@@ -212,7 +212,7 @@ clear_overlay_area() {
       fi
     done <<< "${overlay_rows}"
 
-    if [ "${#part_num_list}" -eq 0 ]; then
+    if [ "${#part_num_list[@]}" -eq 0 ]; then
       return 0
     fi
 
