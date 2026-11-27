@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -e
 
 ## Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
 ## See the file COPYING for copying conditions.
@@ -66,6 +66,7 @@ default_luks_uuid='40e273d7-4e63-4459-b16f-ba3df4374905'
 
 open_mapper=''
 seed_mount_dir=''
+transient_keyfile=''
 persist_type_guid=''
 passphrase=''
 target_device=''
@@ -188,7 +189,7 @@ read_passphrase() {
 ## Deletes all structures in the way of creating overlay partitions.
 clear_overlay_area() {
   local -a part_num_list part_path_list
-  local part_num part_label part_path
+  local part_num part_label part_path overlay_rows
 
   part_num_list=()
   part_path_list=()
@@ -197,6 +198,10 @@ clear_overlay_area() {
     ## Find and delete only existing overlay partitions.
     udevadm settle || return 1
 
+    ## Capture lsblk FIRST so a failure (e.g. an unsupported column on an older
+    ## util-linux) returns an error instead of a silent empty list that would be
+    ## mistaken for 'no overlay partitions' and skip the cleanup.
+    overlay_rows="$(lsblk --noheadings --raw --paths --output=NAME,PARTN,PARTLABEL "${target_device}")" || return 1
     while read -r part_path part_num part_label; do
       if [[ "${part_label}" =~ ^("${persistence_label}"|"${boot_label}")$ ]]; then
         if [ -z "${part_num}" ]; then
@@ -205,7 +210,7 @@ clear_overlay_area() {
         part_num_list+=( "${part_num}" )
         part_path_list+=( "${part_path}" )
       fi
-    done < <(lsblk --noheadings --raw --paths --output=NAME,PARTN,PARTLABEL "${target_device}")
+    done <<< "${overlay_rows}"
 
     if [ "${#part_num_list}" -eq 0 ]; then
       return 0
@@ -234,7 +239,7 @@ clear_overlay_area() {
 
 ## Creates the persistent overlay partitions and record their locations.
 create_partitions() {
-  local lsblk_output part_name part_label
+  local lsblk_output part_name part_label boot_parent persist_parent
 
   log_run notice sgdisk --new="0:0:+${boot_size}" --typecode="0:${persist_type_guid_plain}" --change-name="0:${boot_label}" -- "${target_device}" || return 1
   log_run notice sgdisk --new="0:0:0" --typecode="0:${persist_type_guid}" --change-name="0:${persistence_label}" -- "${target_device}" || return 1
@@ -259,6 +264,18 @@ create_partitions() {
 
   [ -n "${boot_partition}" ] || die 1 "No '${boot_partition}' partition on target device '${target_device}'?!"
   [ -n "${persistence_partition}" ] || die 1 "No '${persistence_partition}' partition on target device '${target_device}'?!"
+
+  ## The scan above is deliberately system-wide (so persistence-boot-sync's own
+  ## system-wide re-detection is guaranteed unambiguous). But the located
+  ## partitions MUST be the ones just created on target_device: if the target
+  ## vanished mid-operation and an unrelated attached disk happens to carry the
+  ## same labels, the scan would pick that disk and the following wipefs/mkfs
+  ## would destroy its data. Refuse to write to a non-target disk.
+  boot_parent="$(lsblk --noheadings --nodeps --paths --output PKNAME -- "${boot_partition}" 2>/dev/null | head --lines 1)" || boot_parent=''
+  persist_parent="$(lsblk --noheadings --nodeps --paths --output PKNAME -- "${persistence_partition}" 2>/dev/null | head --lines 1)" || persist_parent=''
+  if [ "${boot_parent}" != "${target_device}" ] || [ "${persist_parent}" != "${target_device}" ]; then
+    die 1 "Overlay partitions are not on target device '${target_device}' (boot parent '${boot_parent}', persistence parent '${persist_parent}')! Refusing to write."
+  fi
 }
 
 ## Wipe signatures from a storage device, avoiding conflicts with udev.
@@ -280,7 +297,13 @@ wipefs_settle() {
 ## configuration into it.
 setup_boot_fs() {
   mkfs.ext4 -L "${boot_label}" -- "${boot_partition}" || return 1
-  persistence-boot-sync || return 1
+  ## Provisioning call: there is no active overlay yet, so run persistence-boot-sync
+  ## in provisioning mode (bypasses its active-overlay gate, treats failures as
+  ## fatal, and uses the new volume's luks uuid -- empty for an unencrypted
+  ## overlay). Its exit status is our only check that the boot area was populated.
+  PERSISTENCE_BOOT_SYNC_PROVISION='true' \
+    PERSISTENCE_BOOT_SYNC_LUKS_UUID="${luks_uuid}" \
+    persistence-boot-sync || return 1
 }
 
 ## Formats the persistence partition and creates overlayfs directories in it.
@@ -315,11 +338,26 @@ setup_persistence_fs() {
         crypt_cmd+=(
           --unlock-key-file="${keyfile}" -- "${persistence_partition}"
         )
-        log_run notice "${crypt_msg[@]}" || return 1
+        log_run notice "${crypt_cmd[@]}" || return 1
       else
-        crypt_cmd+=( -- "${persistence_partition}" )
+        ## systemd-cryptenroll must unlock the volume to add the TPM key, but it
+        ## does not reliably read the unlock passphrase from a stdin pipe (with a
+        ## controlling terminal present it prompts there instead). Feed the
+        ## passphrase via the documented, non-interactive --unlock-key-file
+        ## mechanism using a transient root-only key file. It holds the passphrase
+        ## with NO trailing newline, matching the key bytes cryptsetup enrolled
+        ## from the piped passphrase; the cleanup trap shreds it on any exit.
+        transient_keyfile="$(mktemp)" || return 1
+        chmod 0600 -- "${transient_keyfile}"
+        printf '%s' "${passphrase}" > "${transient_keyfile}"
+        crypt_cmd+=(
+          --unlock-key-file="${transient_keyfile}" -- "${persistence_partition}"
+        )
         log notice "Command executing: $ ${crypt_cmd[*]}"
-        printf '%s\n' "${passphrase}" | "${crypt_cmd[@]}" || return 1
+        "${crypt_cmd[@]}" || return 1
+        shred --remove -- "${transient_keyfile}" 2>/dev/null \
+          || safe-rm --force -- "${transient_keyfile}"
+        transient_keyfile=''
       fi
     fi
 
@@ -329,7 +367,7 @@ setup_persistence_fs() {
       crypt_cmd+=(
         --key-file "${keyfile}" -- "${persistence_partition}" "${open_mapper}"
       )
-      log_run notice "${crypt_msg[@]}" || return 1
+      log_run notice "${crypt_cmd[@]}" || return 1
     else
       crypt_cmd+=( -- "${persistence_partition}" "${open_mapper}" )
       log notice "Command executing: $ ${crypt_cmd[*]}"
@@ -366,15 +404,122 @@ persistence_setup_cleanup() {
   if [ -n "${open_mapper}" ] && [ -b "/dev/mapper/${open_mapper}" ]; then
     cryptsetup luksClose "${open_mapper}" || true
   fi
+  if [ -n "${transient_keyfile}" ] && [ -e "${transient_keyfile}" ]; then
+    shred --remove -- "${transient_keyfile}" 2>/dev/null \
+      || safe-rm --force -- "${transient_keyfile}" 2>/dev/null || true
+  fi
+}
+
+## Validate encryption-related arguments and resolve encryption-derived state
+## (persist_type_guid, default luks_uuid, passphrase). Dies on invalid input.
+## Reads do_encrypt/passphrase_file/keyfile/luks_uuid/use_tpm; kept separate from
+## main() so the validation is unit-testable without as_root / live-mode.
+validate_encryption_args() {
+  local secret_size
+
+  if [ "${do_encrypt}" = 'true' ]; then
+    if [ -z "${passphrase_file}" ] && [ -z "${keyfile}" ]; then
+      log error "--encrypt is 'true', but neither --passphrase-file nor --keyfile was specified!"
+      if [ "${use_tpm}" = 'true' ]; then
+        log info 'Hint: --use-tpm cannot be used as an encryption method by itself.'
+      fi
+      die 1 'Cannot proceed.'
+    fi
+
+    ## '-' selects stdin (see --passphrase-file in usage); it is not a real path,
+    ## so skip the readability check for it (read_passphrase handles '-').
+    if [ -n "${passphrase_file}" ] && [ "${passphrase_file}" != '-' ] \
+      && ! [ -r "${passphrase_file}" ]; then
+      die 1 'The specified passphrase file does not exist or cannot be read!'
+    fi
+
+    if [ -n "${keyfile}" ]; then
+      if ! [ -r "${keyfile}" ]; then
+        die 1 'The specified keyfile does not exist or cannot be read!'
+      fi
+      secret_size="$(stat --format='%s' -- "${keyfile}")"
+      if ! is_whole_number_int64 "${secret_size}" || [ "${secret_size}" -lt 16 ]; then
+        die 1 "--keyfile '${keyfile}' is too small (${secret_size} bytes); need at least 16 bytes of key material."
+      fi
+    fi
+
+    persist_type_guid="${persist_type_guid_luks}"
+    ## Apply the default UUID BEFORE validating, so an omitted --luks-uuid uses the
+    ## default; an explicitly-passed UUID overrides it and is still validated.
+    if [ -z "${luks_uuid}" ]; then
+      luks_uuid="${default_luks_uuid}"
+    fi
+    if ! [[ "${luks_uuid}" =~ ^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$ ]]; then
+      die 1 "--luks-uuid must be a UUID, got '${luks_uuid}'."
+    fi
+
+    if [ -n "${passphrase_file}" ]; then
+      read_passphrase
+      if [ -z "${passphrase}" ]; then
+        die 1 "Empty passphrase read from '${passphrase_file}'!"
+      fi
+    fi
+  else
+    if [ -n "${passphrase_file}" ] || [ -n "${keyfile}" ] \
+      || [ -n "${luks_uuid}" ] || [ "${use_tpm}" = 'true' ]; then
+      die 1 "--encrypt is 'false', but an encryption-specific option was specified!"
+    fi
+
+    persist_type_guid="${persist_type_guid_plain}"
+  fi
+}
+
+## Classify pre-existing on-disk content a non-forced run must refuse. Sets
+## 'existing_state' to a human description, or '' when the run may proceed.
+## Reads use_freespace/do_force/target_device/persistence_label/boot_label.
+## Kept separate so the guard is unit-testable with stubbed lsblk / blkid.
+detect_existing_state() {
+  local col_fstype col_partlabel col_label
+
+  existing_state=''
+
+  if [ "${use_freespace}" = 'true' ]; then
+    ## --force on the live ISO disk: it ALWAYS carries a partition table, so a
+    ## whole-disk signature check would always refuse. Only reuse of an existing
+    ## overlay partition matters, and clear_overlay_area removes those.
+    if [ "${do_force}" = 'true' ]; then
+      return 0
+    fi
+
+    ## Check for the overlay partitions/filesystems this script creates while
+    ## ignoring the ISO's own partitions.
+    col_fstype="$(lsblk --noheadings --raw --output=FSTYPE -- "${target_device}")" || return 1
+    col_partlabel="$(lsblk --noheadings --raw --output=PARTLABEL -- "${target_device}")" || return 1
+    col_label="$(lsblk --noheadings --raw --output=LABEL -- "${target_device}")" || return 1
+
+    if grep --fixed-strings --line-regexp -- 'crypto_LUKS' <<< "${col_fstype}" >/dev/null 2>&1; then
+      existing_state='a LUKS volume'
+    elif grep --fixed-strings --line-regexp \
+        --regexp="${persistence_label}" --regexp="${boot_label}" <<< "${col_partlabel}" >/dev/null 2>&1 \
+      || grep --fixed-strings --line-regexp -- "${persistence_label}" <<< "${col_label}" >/dev/null 2>&1; then
+      existing_state='an existing overlay partition'
+    fi
+  else
+    ## Explicit --device whole-disk target: refuse to wipe a disk that already
+    ## holds a partition table or filesystem unless --force is given (honouring
+    ## the documented --force contract). A blank disk proceeds without --force.
+    if [ "${do_force}" = 'true' ]; then
+      return 0
+    fi
+    if [ -n "$(blkid --output=value --match-tag=PTTYPE -- "${target_device}" 2>/dev/null || true)" ]; then
+      existing_state='an existing partition table'
+    elif [ -n "$(blkid --output=value --match-tag=TYPE -- "${target_device}" 2>/dev/null || true)" ]; then
+      existing_state='an existing filesystem'
+    fi
+  fi
 }
 
 main() {
-  local secret_size dep_list boot_disk device_opt_tmp device_opt_type \
-    existing_state col_fstype col_partlabel col_label
+  local boot_disk device_opt_tmp device_opt_type existing_state
 
   ## Ensure we have all needed dependencies.
   die_if_not_has lsblk blkid sgdisk wipefs cryptsetup udevadm mount umount \
-    mountpoint mktemp findmnt shred awk partprobe sort comm stat cp uname \
+    mountpoint mktemp findmnt shred safe-rm awk partprobe sort comm stat cp uname \
     head cat mkfs.ext4 mkfs.btrfs systemd-cryptenroll persistence-boot-sync
 
   ## Validate system state.
@@ -440,52 +585,7 @@ main() {
   fi
   range_arg encrypt "${do_encrypt}" true false
 
-  if [ "${do_encrypt}" = 'true' ]; then
-    if [ -z "${passphrase_file}" ] && [ -z "${keyfile}" ]; then
-      log error "--encrypt is 'true', but neither --passphrase-file nor --keyfile was specified!"
-      if [ "${use_tpm}" = 'true' ]; then
-        log info 'Hint: --use-tpm cannot be used as an encryption method by itself.'
-      fi
-      die 1 'Cannot proceed.'
-    fi
-
-    if [ -n "${passphrase_file}" ] && ! [ -r "${passphrase_file}" ]; then
-      die 1 'The specified passphrase file does not exist or cannot be read!'
-    fi
-
-    if [ -n "${keyfile}" ]; then
-      if ! [ -r "${keyfile}" ]; then
-        die 1 'The specified keyfile does not exist or cannot be read!'
-      fi
-      secret_size="$(stat --format='%s' -- "${keyfile}")"
-      if ! is_whole_number_int64 "${secret_size}" || [ "${secret_size}" -lt 16 ]; then
-        die 1 "--keyfile '${keyfile}' is too small (${secret_size} bytes); need at least 16 bytes of key material."
-      fi
-    fi
-
-    if ! [[ "${luks_uuid}" =~ ^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$ ]]; then
-      die 1 "--luks-uuid must be a UUID, got '${luks_uuid}'."
-    fi
-
-    persist_type_guid="${persist_type_guid_luks}"
-    if [ -z "${luks_uuid}" ]; then
-      luks_uuid="${default_luks_uuid}"
-    fi
-
-    if [ -n "${passphrase_file}" ]; then
-      read_passphrase
-      if [ -z "${passphrase}" ]; then
-        die 1 "Empty passphrase read from '${passphrase_file}'!"
-      fi
-    fi
-  else
-    if [ -n "${passphrase_file}" ] || [ -n "${keyfile}" ] \
-      || [ -n "${luks_uuid}" ] || [ "${use_tpm}" = 'true' ]; then
-      die 1 "--encrypt is 'false', but an encryption-specific option was specified!"
-    fi
-
-    persist_type_guid="${persist_type_guid_plain}"
-  fi
+  validate_encryption_args
 
   boot_disk="$(resolve_boot_disk)"
 
@@ -529,32 +629,9 @@ main() {
     target_device="${device_opt}"
   fi
 
-  existing_state=''
-  if [ "${use_freespace}" = 'true' ]; then
-    ## Check for the types of partitions this script creates while ignoring
-    ## those from the ISO.
-    col_fstype="$(lsblk --noheadings --raw --output=FSTYPE -- "${target_device}")"
-    col_partlabel="$(lsblk --noheadings --raw --output=PARTLABEL -- "${target_device}")"
-    col_label="$(lsblk --noheadings --raw --output=LABEL -- "${target_device}")"
-
-    if [ "${do_force}" = 'false' ]; then
-      if grep --fixed-strings --line-regexp -- 'crypto_LUKS' <<< "${col_fstype}" >/dev/null 2>&1; then
-        existing_state='a LUKS volume'
-      elif grep --fixed-strings --line-regexp --regexp="${persistence_label}" --regex="${boot_label}" >/dev/null 2>&1 \
-        || grep --fixed-strings --line-regexp -- "${persistence_label}" <<< "${col_label}" >/dev/null 2>&1; then
-        existing_state='an existing overlay partition'
-      fi
-    else
-      if [ -n "$(blkid --output=value --match-tag=PTTYPE -- "${target_device}" 2>/dev/null || true)" ]; then
-        existing_state='an existing partition table'
-      elif [ -n "$(blkid --output=value --match-tag=TYPE -- "${target_device}" 2>/dev/null || true)" ]; then
-        existing_state='an existing filesystem'
-      fi
-    fi
-
-    if [ -n "${existing_state}" ]; then
-      die 1 "Target device '${target_device}' already has ${existing_state}, rejecting. Use --force to override."
-    fi
+  detect_existing_state || die 1 "Failed to inspect '${target_device}' for existing content!"
+  if [ -n "${existing_state}" ]; then
+    die 1 "Target device '${target_device}' already has ${existing_state}, rejecting. Use --force to override."
   fi
 
   ## Set up the overlay partition.
