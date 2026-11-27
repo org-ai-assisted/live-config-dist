@@ -17,6 +17,7 @@ true "
 "
 
 ## HARDCODED! user name 'user'
+## style-ok: lpe-home-recursive-write -- removes one named user-owned file; rm of the path unlinks a symlink itself (no follow), and the user already controls their own Desktop, so no privilege gain.
 rm -r -f --verbose /home/user/Desktop/install-host.desktop
 
 ## https://phabricator.whonix.org/T377
