@@ -7,10 +7,13 @@ set -o errexit
 set -o nounset
 set -o errtrace
 set -o pipefail
+shopt -s inherit_errexit
+shopt -s shift_verbose
+export LC_ALL=C
 
-readarray -t new_kb_lines < /dev/shm/fixkb-layout || true
+readarray -t new_kb_lines < /run/fixkb-layout || true
 if [ "${#new_kb_lines[@]}" != '3' ]; then
-  printf '%s\n' "$0: ERROR: Absent or corrupt keyboard layout information in '/dev/shm/fixkb-layout'!"
+  printf '%s\n' "$0: ERROR: Absent or corrupt keyboard layout information in '/run/fixkb-layout'!"
   exit 1
 fi
 
