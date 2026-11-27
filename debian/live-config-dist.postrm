@@ -17,8 +17,16 @@ true "
 "
 
 ## HARDCODED! user name 'user'
-## style-ok: lpe-home-recursive-write -- removes one named user-owned file; rm of the path unlinks a symlink itself (no follow), and the user already controls their own Desktop, so no privilege gain.
-rm -r -f --verbose /home/user/Desktop/install-host.desktop
+## Remove the launcher AS THE OWNING USER, never as root: 'rm' does not follow a
+## symlink as the final path component, but it DOES follow symlinks in parent
+## components, so a root-level 'rm /home/user/Desktop/install-host.desktop' would
+## follow a user-planted '/home/user/Desktop' symlink and delete outside the home.
+## runuser drops to 'user', so all path resolution uses the user's own privileges
+## and a user can only affect their own files. Plain file -> no '-r'.
+## style-ok: lpe-home-recursive-write -- removal runs unprivileged via runuser; root never resolves the user-controlled path, so no privilege gain.
+if getent passwd user >/dev/null 2>&1; then
+   runuser -u user -- rm -f --verbose /home/user/Desktop/install-host.desktop || true
+fi
 
 ## https://phabricator.whonix.org/T377
 ## Debian has no update-grub trigger yet:
