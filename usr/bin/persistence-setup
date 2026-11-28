@@ -179,10 +179,15 @@ device_is_busy() {
 
 ## Read an encryption passphrase from stdin or a file.
 read_passphrase() {
+  ## Read only the FIRST line, from stdin AND from a file alike: cryptsetup
+  ## consumes a single line from the luksFormat pipe, so the keyslot is the first
+  ## line; the TPM transient unlock-key-file must hold those same bytes. Reading
+  ## the whole file would mismatch (multi-line passphrase) or, for a leading
+  ## newline, slip an EMPTY keyslot past the non-empty check below.
   if [ "${passphrase_file}" = '-' ]; then
     IFS= read -r passphrase || true
   else
-    passphrase="$(< "${passphrase_file}")"
+    IFS= read -r passphrase < "${passphrase_file}" || true
   fi
 }
 
