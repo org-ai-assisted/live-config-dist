@@ -18,14 +18,9 @@ fi
 # shellcheck source=../../../../helper-scripts/usr/libexec/helper-scripts/has.bsh
 source "${HELPER_SCRIPTS_PATH:-}"/usr/libexec/helper-scripts/has.bsh
 
-## Path globals. Env-overridable so a test can drive the whole script end-to-end
-## against a temp tree (production leaves them unset -> the absolute defaults).
-## legacy_dist_do_once_dir holds the mok-ok flag that check-image-builtin-mok trusts
-## to short-circuit its leaked-key detection.
-mok_enroll_log_file="${MOK_ENROLL_OPT_IN_LOG_FILE:-/var/log/mok-enroll-opt-in.log}"
-efi_sysfs_dir="${MOK_ENROLL_OPT_IN_EFI_SYSFS_DIR:-/sys/firmware/efi}"
-dkms_mok_public_file="${MOK_ENROLL_OPT_IN_DKMS_MOK_PUBLIC_FILE:-/var/lib/dkms/mok.pub}"
-legacy_dist_do_once_dir="${MOK_ENROLL_OPT_IN_DO_ONCE_DIR:-/var/lib/legacy-dist/do_once}"
+mok_enroll_log_file='/var/log/mok-enroll-opt-in.log'
+efi_sysfs_dir='/sys/firmware/efi'
+dkms_mok_public_file='/var/lib/dkms/mok.pub'
 
 mok_log() {
    printf '%s\n' "$(date -u +%FT%TZ 2>/dev/null || true) $*" \
@@ -63,14 +58,7 @@ mok_enroll_opt_in() {
       printf '%s\n' "$0: vbox-guest-installer not present, skipping VirtualBox GA module signing."
    fi
 
-   mok_pub_state='MISSING'
-   if [ -f "${dkms_mok_public_file}" ]; then
-      mok_pub_state='present'
-      mok_log "run: creating legacy-dist mok-ok flag"
-      mkdir --parents -- "${legacy_dist_do_once_dir}"
-      touch -- "${legacy_dist_do_once_dir}/mok-ok"
-   fi
-   mok_log "done: mok.pub ${mok_pub_state}"
+   mok_log "done"
    printf '%s\n' "$0: done; public cert for enrollment is at ${dkms_mok_public_file}."
 }
 
