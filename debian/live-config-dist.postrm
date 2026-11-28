@@ -6,40 +6,54 @@
 if [ -f /usr/libexec/helper-scripts/pre.bsh ]; then
    source /usr/libexec/helper-scripts/pre.bsh
 fi
+source /usr/libexec/helper-scripts/has.bsh
 
-set -x
-set -e
+set -o errexit
+set -o nounset
+set -o pipefail
+set -o errtrace
+shopt -s inherit_errexit
+shopt -s shift_verbose
+export LC_ALL=C
 
 true "
 #####################################################################
-## INFO: BEGIN: $DPKG_MAINTSCRIPT_PACKAGE $DPKG_MAINTSCRIPT_NAME $@
+## INFO: BEGIN: ${DPKG_MAINTSCRIPT_PACKAGE:-} ${DPKG_MAINTSCRIPT_NAME:-} $*
 #####################################################################
 "
 
 ## HARDCODED! user name 'user'
-rm -r -f --verbose /home/user/Desktop/install-host.desktop
+## Remove the launcher AS THE OWNING USER, never as root: 'rm' does not follow a
+## symlink as the final path component, but it DOES follow symlinks in parent
+## components, so a root-level 'rm /home/user/Desktop/install-host.desktop' would
+## follow a user-planted '/home/user/Desktop' symlink and delete outside the home.
+## runuser drops to 'user', so all path resolution uses the user's own privileges
+## and a user can only affect their own files. Plain file -> no '-r'.
+## style-ok: lpe-home-recursive-write -- removal runs unprivileged via runuser; root never resolves the user-controlled path, so no privilege gain.
+if getent passwd user >/dev/null 2>&1; then
+   runuser -u user -- rm -f --verbose /home/user/Desktop/install-host.desktop || true
+fi
 
 ## https://phabricator.whonix.org/T377
 ## Debian has no update-grub trigger yet:
 ## https://bugs.debian.org/481542
-if command -v update-grub >/dev/null 2>&1; then
+if has update-grub ; then
    update-grub || \
-      echo "$DPKG_MAINTSCRIPT_PACKAGE $DPKG_MAINTSCRIPT_NAME ERROR: Running \
-'update-grub' failed with exit code $?. $DPKG_MAINTSCRIPT_PACKAGE is most \
-likely only the trigger, not the cause. Unless you know this is not an issue, \
-you should fix running 'update-grub', otherwise your system might no longer \
-boot." >&2
+      printf '%s\n' "${DPKG_MAINTSCRIPT_PACKAGE:-} ${DPKG_MAINTSCRIPT_NAME:-} ERROR: Running 'update-grub' failed with exit code ${?}. ${DPKG_MAINTSCRIPT_PACKAGE:-} is most likely only the trigger, not the cause. Unless you know this is not an issue, you should fix running 'update-grub', otherwise your system might no longer boot." >&2
 fi
 
 true "INFO: debhelper beginning here."
 
+## debhelper-generated snippets reference unset positional args.
+set +o nounset
 #DEBHELPER#
+set -o nounset
 
 true "INFO: Done with debhelper."
 
 true "
 #####################################################################
-## INFO: END  : $DPKG_MAINTSCRIPT_PACKAGE $DPKG_MAINTSCRIPT_NAME $@
+## INFO: END  : ${DPKG_MAINTSCRIPT_PACKAGE:-} ${DPKG_MAINTSCRIPT_NAME:-} $*
 #####################################################################
 "
 

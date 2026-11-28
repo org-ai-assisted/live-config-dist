@@ -9,11 +9,20 @@ set -o errexit
 set -o nounset
 set -o errtrace
 set -o pipefail
+shopt -s inherit_errexit
+shopt -s shift_verbose
+export LC_ALL=C
 
 setxkbmap_output="$(setxkbmap -query)"
 kb_layout="$(awk '/layout/{ print $2 }' <<< "${setxkbmap_output}")"
 kb_variant="$(awk '/variant/{ print $2 }' <<< "${setxkbmap_output}")"
 kb_options="$(awk '/options/{ print $2 }' <<< "${setxkbmap_output}")"
-printf '%s\n' "${kb_layout}" "${kb_variant}" "${kb_options}" > /dev/shm/fixkb-layout
 
-mount --bind /dev/shm "$1"/dev/shm
+## Hand the three values to fixkblayout-part2 (which runs inside the target
+## chroot) via a root-owned file in the target root, NOT world-writable
+## /dev/shm. "$1" is Calamares' ${ROOT} (the mounted target); part2's in-chroot
+## /run IS this same "$1"/run directory, so the handoff needs no bind mount, and
+## /run becomes a fresh tmpfs at the installed system's first boot (self-cleaning).
+mkdir --parents -- "$1/run"
+## style-ok: lpe-symlink-follow,lpe-root-write-user-path -- "$1" is Calamares' ${ROOT}, the installer-controlled root-owned target mount; no untrusted writer exists during install, so this is not a world-writable or attacker-plantable path.
+printf '%s\n' "${kb_layout}" "${kb_variant}" "${kb_options}" > "$1/run/fixkb-layout"

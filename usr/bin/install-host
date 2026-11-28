@@ -19,8 +19,8 @@ shopt -s inherit_errexit
 shopt -s shift_verbose
 export LC_ALL=C
 
-# shellcheck source=../../../helper-scripts/usr/libexec/helper-scripts/light_sleep.bsh
-source "${HELPER_SCRIPTS_PATH:-}"/usr/libexec/helper-scripts/light_sleep.bsh
+# shellcheck source=../../../helper-scripts/usr/libexec/helper-scripts/try-wait-for-system-ready
+source "${HELPER_SCRIPTS_PATH:-}"/usr/libexec/helper-scripts/try-wait-for-system-ready
 
 kernel_cmdline=''
 if [ -f /proc/cmdline ]; then
@@ -47,18 +47,7 @@ fi
 ## Wait for the system to become fully up before starting installation. In
 ## particular, this prevents calling privileged commands in unrestricted admin
 ## mode until after sudo becomes available.
-waited=0
-while [ "${waited}" -lt 36 ]; do
-   system_ready_result="$(leaprun system-ready-check 2>/dev/null || true)"
-   if [ "${system_ready_result}" = 'running' ] || [ "${system_ready_result}" = 'degraded' ]; then
-      break
-   fi
-   if [ "${waited}" = '0' ]; then
-      printf '%s\n' "$0: waiting for the system to finish starting..."
-   fi
-   light_sleep 1
-   waited=$(( waited + 1 ))
-done
+try_wait_for_system_ready
 
 if ! [ -x '/usr/bin/pkexec' ] || ! [ -x '/usr/bin/sudo' ]; then
    printf '%s\n' "$0: ERROR: **Unable To Elevate To Root**

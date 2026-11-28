@@ -49,7 +49,7 @@ if pkg_installed "grub-efi-${system_arch}"; then
       exit "${reconfigure_rc}"
    fi
 
-   ## grub-efi's postinst emits a warning when GRUB installaiont fails, but we
+   ## grub-efi's postinst emits a warning when GRUB installation fails, but we
    ## want to treat this as fatal.
    case "${reconfigure_output}" in
       *"Failed: grub-install"*)

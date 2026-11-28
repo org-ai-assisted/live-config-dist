@@ -15,6 +15,9 @@ if ! declare -F was_executed >/dev/null; then
    exit 1
 fi
 
+# shellcheck source=../../../../helper-scripts/usr/libexec/helper-scripts/has.bsh
+source "${HELPER_SCRIPTS_PATH:-}"/usr/libexec/helper-scripts/has.bsh
+
 mok_enroll_log_file='/var/log/mok-enroll-opt-in.log'
 efi_sysfs_dir='/sys/firmware/efi'
 dkms_mok_public_file='/var/lib/dkms/mok.pub'
@@ -47,14 +50,15 @@ mok_enroll_opt_in() {
    printf '%s\n' "$0: MOK_ENROLL set and EFI detected; creating MOK and signing out-of-tree modules."
    shim-signed-mok-setup
    rebuild-dkms-modules
-   ## Oracle VirtualBox Guest Additions modules are built outside DKMS.
-   vbox-guest-installer
-
-   mok_pub_state='MISSING'
-   if [ -f "${dkms_mok_public_file}" ]; then
-      mok_pub_state='present'
+   ## VirtualBox Guest Additions modules are built outside DKMS.
+   if has vbox-guest-installer; then
+      vbox-guest-installer
+   else
+      mok_log "skip: vbox-guest-installer absent"
+      printf '%s\n' "$0: vbox-guest-installer not present, skipping VirtualBox GA module signing."
    fi
-   mok_log "done: mok.pub ${mok_pub_state}"
+
+   mok_log "done"
    printf '%s\n' "$0: done; public cert for enrollment is at ${dkms_mok_public_file}."
 }
 
